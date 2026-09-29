@@ -305,19 +305,75 @@ const App = (() => {
     }
   }
 
-  function updateStatusButtons() {
+  /* 状态展示：除"待裁决"外不由人工设置，翻图时自动判定（有差异→已修改 / 无差异→已核验无修改） */
+  const STATUS_LABELS = {
+    "未复核": "○ 未复核", "已核验无修改": "✅ 已核验无修改",
+    "已修改": "✏️ 已修改", "待裁决": "⚖️ 待裁决",
+  };
+  function updateStatusUI() {
     const st = state.image ? state.image.status : "";
-    for (const b of document.querySelectorAll(".sbtn")) {
-      b.classList.toggle("active", b.dataset.status === st);
+    const el = $("#status-text");
+    if (el) {
+      el.textContent = state.image ? (STATUS_LABELS[st] || st) : "—";
+      el.className = "status-text " + st;
+    }
+    const arb = $("#btn-arb");
+    if (arb) {
+      arb.classList.toggle("active", st === "待裁决");
+      arb.textContent = st === "待裁决" ? "⚖️ 待裁决（S 取消）" : "⚖️ 待裁决";
     }
     if (state.image) {
       $("#img-note").value = state.image.note || "";
     }
   }
 
+  /* 翻图自动判定：待裁决保留不动（force=true 时强制按差异判定，用于 S 取消待裁决）；其余按差异自动 已修改/已核验无修改 */
+  async function autoResolveStatus(force = false) {
+    if (!state.image || (state.image.status === "待裁决" && !force)) return;
+    const target = state.image.has_changes ? "已修改" : "已核验无修改";
+    if (state.image.status === target) return;
+    try {
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
+        status: target,
+        note: $("#img-note").value,
+        verified_box_ids: state.image.verified_box_ids,
+      });
+      state.image.status = r.status;
+      state.image.note = r.note;
+      state.image.has_changes = r.has_changes;
+      updateStatusUI();
+      await refreshProgress();
+    } catch (e) { /* 忽略：下次翻图自动重试 */ }
+  }
+
+  /* S：待裁决 toggle；取消时按差异自动判定 */
+  async function toggleArb() {
+    if (!state.image) return;
+    await flush();
+    if (state.image.status === "待裁决") {
+      await autoResolveStatus(true);   // 取消待裁决 → 按差异自动判定
+      toast(state.image.status === "待裁决" ? "取消失败，请重试"
+        : `已取消待裁决 ⚖️（自动判定：${state.image.status}）`, state.image.status === "待裁决" ? "error" : "ok");
+      return;
+    }
+    try {
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
+        status: "待裁决",
+        note: $("#img-note").value,
+        verified_box_ids: state.image.verified_box_ids,
+      });
+      state.image.status = r.status;
+      state.image.note = r.note;
+      updateStatusUI();
+      await refreshProgress();
+      toast("图片已标为待裁决 ⚖️（再按 S 取消）", "ok");
+    } catch (e) { toast(e.message, "error"); }
+  }
+
   async function openQueueImage(idx) {
     if (idx < 0 || idx >= state.queue.length) return;
     await flush();
+    await autoResolveStatus();   // 翻走前自动判定上一张状态（待裁决保留）
     const row = state.queue[idx];
     state.queueIdx = idx;
     updateNavUI();
@@ -331,16 +387,25 @@ const App = (() => {
       const token = ++state.prefetchToken;
       const im = await ImageStore.load(row.img_id, row.name);
       if (token !== state.prefetchToken) return; // 已切走
+      const keepCrop = CanvasView.getViewMode() === "crop";
       CanvasView.setImage(im);
       CanvasView.setBoxes(state.image.boxes);
+      // 新图就位后再退出特写（旧图 bitmap 已被 ImageStore 回收，不能提前渲染）
+      if (keepCrop) CanvasView.setViewMode("full");
       CanvasView.render();
       renderCrops();
-      updateStatusButtons();
+      updateStatusUI();
       setBadge("saved");
       // 预取下一张
       if (state.queue[idx + 1]) ImageStore.prefetch(state.queue[idx + 1].img_id);
-      // T1：自动选中第一个未核验目标框
-      if (state.task && state.task.kind === "t1") {
+      // 特写模式保持：新图从第一个轮播框开始（无可见框则回全图）
+      if (keepCrop) {
+        const ids = CropPanel.shownBoxIds;
+        if (ids.length) enterCrop(ids[0]);
+        else CanvasView.setViewMode("full");
+      }
+      // T1：全图模式下自动选中第一个未核验目标框
+      if (CanvasView.getViewMode() !== "crop" && state.task && state.task.kind === "t1") {
         const vb = new Set(state.image.verified_box_ids);
         const t = state.image.boxes.find(b =>
           state.task.class_ids.includes(b.class_id) && !vb.has(b.id));
@@ -419,17 +484,17 @@ const App = (() => {
       state.image.has_changes = r.has_changes;
       CanvasView.setBoxes(state.image.boxes);
       renderCrops();
-      updateStatusButtons();
+      updateStatusUI();
       updateNavUI();
       for (const w of r.warnings || []) toast(w, "warn");
-      // 撤销至无差异且无备注 → 状态自动回退"未复核"（与服务端 reset 语义一致）
+      // 撤销至无差异且无备注 → 自动回"已核验无修改"（该图已看过；翻图时统一自动判定兜底）
       if (!r.has_changes && state.image.status === "已修改" &&
           !($("#img-note").value || "").trim()) {
         const s = await Api.put(
           `/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
-          { status: "未复核", note: "", verified_box_ids: state.image.verified_box_ids });
+          { status: "已核验无修改", note: "", verified_box_ids: state.image.verified_box_ids });
         state.image.status = s.status;
-        updateStatusButtons();
+        updateStatusUI();
       }
       await refreshProgress();
       setBadge("saved");
@@ -471,7 +536,7 @@ const App = (() => {
       state.image.status = r.status;
       state.image.note = r.note;
       state.image.has_changes = r.has_changes;
-      updateStatusButtons();
+      updateStatusUI();
       updateNavUI();
       await refreshProgress();
       toast(`状态 → ${status}`, "ok");
@@ -497,7 +562,7 @@ const App = (() => {
       CanvasView.setBoxes(state.image.boxes);
       CanvasView.setSelected(null);
       renderCrops();
-      updateStatusButtons();
+      updateStatusUI();
       updateNavUI();
       await refreshProgress();
       toast("已恢复原始标注", "ok");
@@ -598,33 +663,58 @@ const App = (() => {
     toast(`已降级为 ${tc ? tc.name : targetClassId} 并标记核验`, "ok");
   }
 
+  /* 标注模式右键目标框：点击处右侧菜单 = 删除 + 标签变更列表。
+     重点类（focus）优先显示易混淆类（confusable），其余类收进"更多"（悬停右侧二级列表）。 */
   function contextMenu(boxId, x, y) {
-    const cls = state.wsMeta.classes;
-    const cur = boxId ? state.image.boxes.find(b => b.id === boxId) : null;
     document.querySelectorAll(".context-menu").forEach(el => el.remove());
-    const menu = document.createElement("div");
-    menu.className = "context-menu";
-    menu.style.left = x + "px"; menu.style.top = y + "px";
-    const items = [];
-    if (cur) {
-      items.push(`<button id="cm-class">✏️ 改类（当前 ${cls[cur.class_id] ? cls[cur.class_id].name : "?"}）</button>`);
-      items.push(`<button id="cm-verify">${state.image.verified_box_ids.includes(boxId) ? "↩ 取消框级核验" : "✓ 标记框已核验"}</button>`);
-      items.push(`<button id="cm-delete" class="danger">🗑 删除框</button>`);
-    } else {
-      items.push(`<button id="cm-newclass">✏️ 设置新框默认类（当前 ${cls[state.lastNewClass] ? cls[state.lastNewClass].name : "?"}）</button>`);
+    if (!state.image) return;
+    if (CanvasView.getMode() !== "annotate") {
+      toast("浏览模式仅查看 — 按空格进入标注模式后右键编辑", "warn");
+      return;
     }
-    items.push(`<button id="cm-arb">⚖️ 图片标为待裁决</button>`);
-    menu.innerHTML = items.join('<div class="sep"></div>');
+    if (!boxId) {
+      toast("请右键一个目标框打开菜单（删除 / 改类）", "warn");
+      return;
+    }
+    const cls = state.wsMeta.classes;
+    const b = state.image.boxes.find(v => v.id === boxId);
+    if (!b) return;
+    const c = cls[b.class_id];
+    const confIds = (c && c.confusable) || [];
+    const conf = confIds.map(cid => cls[cid]).filter(Boolean);   // id → 类对象（cls 按 id 索引）
+    const rest = cls.filter(cc => cc.id !== b.class_id && !confIds.includes(cc.id));
+    const clsBtn = (cc) => `<button data-cid="${cc.id}" class="${cc.id === b.class_id ? "selected" : ""}"
+      style="border-left-color:${cc.color}" title="改为 ${cc.name}">${cc.id}·${cc.name}</button>`;
+    const moreBtn = (arr) => `<div class="cm-more">更多 ▸<div class="submenu">${arr.map(clsBtn).join("")}</div></div>`;
+
+    const menu = document.createElement("div");
+    menu.className = "context-menu box-menu";
+    menu.innerHTML = `
+      <div class="cm-title" style="border-left-color:${c.color}">${c.name}${c.focus ? " ⭐" : ""}</div>
+      <button id="cm-delete" class="danger">🗑 删除框</button>
+      <div class="sep"></div>
+      <div class="cm-label">标签变更 →</div>
+      <div class="cm-classes">${
+        c.focus
+          ? conf.map(clsBtn).join("") + (rest.length ? moreBtn(rest) : "")
+          : cls.map(clsBtn).join("")
+      }</div>`;
     document.body.appendChild(menu);
+    // 定位：点击处右侧；放不下则翻到左侧（二级菜单反向）；纵向防出屏
+    const mw = menu.offsetWidth, mh = menu.offsetHeight;
+    let lx = x + 14, ly = y;
+    if (lx + mw > window.innerWidth - 8) { lx = x - 14 - mw; menu.classList.add("flip"); }
+    if (ly + mh > window.innerHeight - 8) ly = window.innerHeight - mh - 8;
+    menu.style.left = Math.max(4, lx) + "px";
+    menu.style.top = Math.max(4, ly) + "px";
+
     const kill = () => menu.remove();
     menu.addEventListener("click", (e) => {
-      const id = e.target.id;
+      const btn = e.target.closest("button");
+      if (!btn) return;
       kill();
-      if (id === "cm-class") classPickModal(boxId);
-      if (id === "cm-verify") toggleVerified(boxId);
-      if (id === "cm-delete") deleteBox(boxId);
-      if (id === "cm-newclass") classPickModal(null, "设置新框默认类");
-      if (id === "cm-arb") setStatus("待裁决");
+      if (btn.id === "cm-delete") { deleteBox(boxId); return; }
+      if (btn.dataset.cid !== undefined) changeBoxClass(boxId, +btn.dataset.cid);
     });
     const onDocDown = (e) => {
       if (!menu.contains(e.target)) { kill(); document.removeEventListener("pointerdown", onDocDown); }
@@ -634,8 +724,54 @@ const App = (() => {
 
   /* ============ 裁剪面板联动 ============ */
   function onPickBox(boxId) {
+    if (CanvasView.getViewMode() === "crop") enterCrop(boxId);
+    else {
+      CanvasView.setSelected(boxId);
+      CanvasView.focusBox(boxId, true);
+    }
+  }
+
+  /* ============ 裁剪特写（W 切换 / Q·E 轮播） ============ */
+  /* 轮播顺序与裁剪面板一致：T1 只含任务关注类别；T2 全部框且重点类（focus）排前 */
+  function cropOrder() { return CropPanel.shownBoxIds; }
+
+  function enterCrop(boxId) {
+    const ids = cropOrder();
+    const i = Math.max(0, ids.indexOf(boxId));
     CanvasView.setSelected(boxId);
-    CanvasView.focusBox(boxId, true);
+    CropPanel.setSelected(boxId);
+    CanvasView.setCropBox(boxId, i + 1, ids.length);
+    CanvasView.setViewMode("crop");
+  }
+
+  function toggleCropView() {
+    if (!state.image) return;
+    if (CanvasView.getViewMode() === "crop") {
+      CanvasView.setViewMode("full");
+      return;
+    }
+    const ids = cropOrder();
+    if (!ids.length) { toast("本图没有可轮播的框", "warn"); return; }
+    enterCrop(ids[0]);   // 默认从第一个框开始
+  }
+
+  function stepCrop(dir) {
+    if (!state.image) return;
+    const ids = cropOrder();
+    if (!ids.length) return;
+    const inCrop = CanvasView.getViewMode() === "crop";
+    let i = ids.indexOf(inCrop ? CanvasView.getCropBox() : CanvasView.getSelected());
+    if (i < 0) i = dir > 0 ? -1 : 0;
+    i = (i + dir + ids.length) % ids.length;   // 循环轮播
+    const id = ids[i];
+    if (inCrop) {
+      enterCrop(id);
+    } else {
+      // 全图模式：Q/E 切换选中框并聚焦
+      CanvasView.setSelected(id);
+      CropPanel.setSelected(id);
+      CanvasView.focusBox(id, true);
+    }
   }
 
   /* ============ 键盘快捷键 ============ */
@@ -658,15 +794,16 @@ const App = (() => {
 
     if (state.view !== "review" || !state.image) return;
 
-    if (e.key === "ArrowLeft") { navImage(-1); return; }
-    if (e.key === "ArrowRight") { navImage(1); return; }
+    if (k === "a" || e.key === "ArrowLeft") { navImage(-1); return; }
+    if (k === "d" || e.key === "ArrowRight") { navImage(1); return; }
+    if (k === "s") { e.preventDefault(); toggleArb(); return; }
+    if (k === "w") { toggleCropView(); return; }
+    if (k === "q") { stepCrop(-1); return; }
+    if (k === "e") { stepCrop(1); return; }
     if (e.key === " ") { e.preventDefault(); toggleMode(); return; }
     if (e.key === "Tab") { e.preventDefault(); nextUnverified(); return; }
     if (e.key === "ArrowUp" || e.key === "ArrowDown") { e.preventDefault(); stepSelection(e.key === "ArrowDown" ? 1 : -1); return; }
-    if (k === "d") { const s = CanvasView.getSelected(); if (s) deleteBox(s); return; }
-    if (k === "e") { const s = CanvasView.getSelected(); if (s) classPickModal(s); else toast("先选中一个框（点击框或裁剪项）", "warn"); return; }
     if (k === "n") { setMode(true); return; }
-    if (k === "s") { setStatus("已核验无修改"); return; }
     if (e.key === "+" || e.key === "=") { CanvasView.zoomIn(); return; }
     if (e.key === "-") { CanvasView.zoomOut(); return; }
     if (k === "0") { CanvasView.fit(); return; }
@@ -677,8 +814,8 @@ const App = (() => {
       return;
     }
     if (k === "g") { jumpImage(); return; }
-    // 数字键 1-9（/0）改选中框类；Shift+数字设置新框默认类
-    const digit = /^[1-9]$/.test(e.key) ? +e.key : (e.key === "0" ? 10 : null);
+    // 数字键 1-9 改选中框类；Shift+数字设置新框默认类
+    const digit = /^[1-9]$/.test(e.key) ? +e.key : null;
     if (digit) {
       const cls = state.wsMeta.classes;
       const cid = digit - 1;
@@ -689,7 +826,7 @@ const App = (() => {
       } else {
         const s = CanvasView.getSelected();
         if (s) changeBoxClass(s, cid);
-        else { state.lastNewClass = cid; toast(`新框默认类 → ${cls[cid].zh}`, "ok"); }
+        else { state.lastNewClass = cid; toast(`新框默认类 → ${cls[cid].name}`, "ok"); }
       }
     }
   }
@@ -701,7 +838,15 @@ const App = (() => {
     btn.textContent = isAnnotate ? "标注模式" : "浏览模式";
     btn.classList.toggle("annotate", isAnnotate);
   }
-  function toggleMode() { setMode(); }
+  function toggleMode() {
+    // 特写模式下标注操作不可用：空格 = 退出特写并直接进入标注模式
+    if (CanvasView.getViewMode() === "crop") {
+      CanvasView.setViewMode("full");
+      setMode(true);
+      return;
+    }
+    setMode();
+  }
 
   async function nextUnverified() {
     // 当前图内下一个未核验目标框
@@ -731,13 +876,15 @@ const App = (() => {
   }
 
   function stepSelection(dir) {
-    if (!state.image.boxes.length) return;
+    if (CanvasView.getViewMode() === "crop") { stepCrop(dir); return; }
+    const ids = cropOrder();
+    if (!ids.length) return;
     const cur = CanvasView.getSelected();
-    let i = cur ? state.image.boxes.findIndex(b => b.id === cur) : -1;
-    i = Math.max(0, Math.min(state.image.boxes.length - 1, i + dir));
-    const b = state.image.boxes[i];
-    CanvasView.setSelected(b.id);
-    CropPanel.setSelected(b.id);
+    let i = cur ? ids.indexOf(cur) : -1;
+    i = Math.max(0, Math.min(ids.length - 1, i + dir));
+    const id = ids[i];
+    CanvasView.setSelected(id);
+    CropPanel.setSelected(id);
   }
 
   /* ============ 导出 ============ */
@@ -846,14 +993,13 @@ const App = (() => {
     $("#btn-create-ws").addEventListener("click", createWorkspace);
     $("#btn-prev").addEventListener("click", () => navImage(-1));
     $("#btn-next").addEventListener("click", () => navImage(1));
+    $("#btn-crop").addEventListener("click", toggleCropView);
     $("#btn-reset-img").addEventListener("click", resetImage);
     $("#btn-mode").addEventListener("click", toggleMode);
     $("#btn-refresh-report").addEventListener("click", refreshReport);
     $("#btn-export").addEventListener("click", doExport);
     $("#img-note").addEventListener("input", scheduleNoteSave);
-    for (const b of document.querySelectorAll(".sbtn")) {
-      b.addEventListener("click", () => setStatus(b.dataset.status));
-    }
+    $("#btn-arb").addEventListener("click", toggleArb);
     document.addEventListener("keydown", onKey);
 
     // Canvas 回调

@@ -31,15 +31,10 @@ const CropPanel = (() => {
     if (clsArr) setClasses(clsArr);
     gridEl.innerHTML = "";
 
-    const task = opts.task;
-    const shown = [];
-    for (const b of boxes) {
-      if (task && task.class_ids && !task.class_ids.includes(b.class_id)) continue;
-      shown.push(b);
-    }
+    const shown = visibleBoxes();
     if (!shown.length) {
       gridEl.innerHTML = `<div class="crop-empty">${
-        task ? "本图无目标类别框，按 Tab 跳到下一图" : "本图无标注框"}</div>`;
+        opts.task ? "本图无目标类别框，按 Tab 跳到下一图" : "本图无标注框"}</div>`;
       return;
     }
     for (const b of shown) {
@@ -155,11 +150,23 @@ const CropPanel = (() => {
     }
   }
 
+  /* 可见框列表：T1 只含任务关注类别；T2 全部框且重点类（focus）排前。轮播/特写/面板共用此顺序 */
+  function visibleBoxes() {
+    const task = opts.task;
+    let arr = boxes.filter(b => !task || !task.class_ids.length || task.class_ids.includes(b.class_id));
+    if (task && task.kind === "t2") {
+      arr = arr.slice().sort((a, b) => {
+        const fa = classById[a.class_id] && classById[a.class_id].focus ? 0 : 1;
+        const fb = classById[b.class_id] && classById[b.class_id].focus ? 0 : 1;
+        return fa - fb;
+      });
+    }
+    return arr;
+  }
+
   /* Tab：下一个未核验框（当前任务过滤范围内） */
   function nextUnverified() {
-    const task = opts.task;
-    for (const b of boxes) {
-      if (task && task.class_ids && !task.class_ids.includes(b.class_id)) continue;
+    for (const b of visibleBoxes()) {
       if (!opts.verifiedIds.has(b.id)) return b;
     }
     return null;
@@ -167,10 +174,6 @@ const CropPanel = (() => {
 
   return {
     init, render, setClasses, setSelected, nextUnverified,
-    get shownBoxIds() {
-      const task = opts.task;
-      return boxes.filter(b => !task || !task.class_ids || task.class_ids.includes(b.class_id))
-                  .map(b => b.id);
-    },
+    get shownBoxIds() { return visibleBoxes().map(b => b.id); },
   };
 })();

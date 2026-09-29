@@ -69,12 +69,13 @@
       <section id="image-area">
         <div id="task-banner"></div>
         <div id="img-nav">
-          <button id="btn-prev" title="上一张 (←)">←</button>
+          <button id="btn-prev" title="上一张 (A / ←)">←</button>
           <span id="img-pos">0 / 0</span>
-          <button id="btn-next" title="下一张 (→)">→</button>
+          <button id="btn-next" title="下一张 (D / →)">→</button>
           <span id="img-name" class="mono"></span>
+          <button id="btn-crop" class="ghost" title="全图 ⇄ 裁剪特写 (W)">🔍 特写</button>
           <button id="btn-reset-img" class="ghost hidden" title="恢复原始标注">恢复原框</button>
-          <button id="btn-mode" class="mode-btn" title="空格切换">浏览模式</button>
+          <button id="btn-mode" class="mode-btn" title="标注/浏览 (空格)">浏览模式</button>
         </div>
         <div id="canvas-wrap">
           <canvas id="main-canvas"></canvas>
@@ -82,9 +83,8 @@
         </div>
         <div id="status-bar">
           <span class="status-btns">
-            <button data-status="已核验无修改" class="sbtn" title="S">✅ 已核验无修改</button>
-            <button data-status="已修改" class="sbtn warn" title="S">✏️ 已修改</button>
-            <button data-status="待裁决" class="sbtn arb" title="S">⚖️ 待裁决</button>
+            <span id="status-text" class="status-text">—</span>
+            <button id="btn-arb" class="sbtn arb" title="标记待裁决 (S)，再按取消">⚖️ 待裁决</button>
           </span>
           <input id="img-note" placeholder="备注/修改说明（如：仅黄反光服 交警→builder）" style="flex:1">
           <span id="save-badge" class="badge">已保存</span>

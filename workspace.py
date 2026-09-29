@@ -53,6 +53,7 @@ def create_workspace(scan, ws_root, config_override=None, batch_dir=None, output
             "color": ext["color"] if ext else "#64748B",
             "identity": bool(ext["identity"]) if ext else False,
             "focus": bool(ext["focus"]) if ext else False,
+            "confusable": [int(x) for x in (ext.get("confusable") or [])] if ext else [],
         })
 
     csv_keyed = scan["csv_keyed"]

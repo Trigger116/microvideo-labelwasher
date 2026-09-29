@@ -56,8 +56,7 @@ const ImageStore = (() => {
       .then(bmp => {
         // 仅当用户尚未切到别的图时缓存
         if (!current || current.img_id !== imgId) {
-          const cache = prefetched;
-          release(cache.bitmap);
+          if (prefetched) release(prefetched.bitmap);
           prefetched = { img_id: imgId, bitmap: bmp };
         } else {
           release(bmp);
