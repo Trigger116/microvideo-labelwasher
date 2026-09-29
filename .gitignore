@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 运行时产物（工作区 / 日志 / 单实例文件）
+workspaces/
+logs/
+*.port
+*.lock
+
+# 构建产物
+build/
+dist/

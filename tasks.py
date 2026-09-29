@@ -1,0 +1,203 @@
+# -*- coding: utf-8 -*-
+"""任务生成与进度派生。
+
+T1（框级类别核验）：由 config.t1_tasks 定义，任务图集 = 含目标类当前框的图。
+T2（全图漏标扫视）：优先读取 batch_dir 下批次清单文件（与人工流程同源）；
+  缺省时按 t2_rules（低框数/高密度/批大小）自算批次。
+"""
+import glob
+import os
+
+from workspace import TERMINAL_STATUSES
+
+
+def _class_names(ws):
+    return {c["id"]: c for c in ws["package"]["classes"]}
+
+
+def _task_image_ids(ws, task):
+    """T1：返回 [(img_id, target_box_ids)]；T2：由批次清单给定 img_id 列表。"""
+    target_class_ids = set(task.get("class_ids") or [])
+    if task["kind"] == "t2":
+        return task["_image_ids"], None
+    pairs = []
+    for im in ws["images"]:
+        tids = [b["id"] for b in im["boxes"] if b["class_id"] in target_class_ids]
+        if tids:
+            pairs.append((im["id"], tids))
+    return pairs, None
+
+
+def gen_t1_tasks(ws):
+    cfg = ws.get("config") or {}
+    names = _class_names(ws)
+    tasks = []
+    for t in cfg.get("t1_tasks") or []:
+        label = " / ".join(names[c]["zh"] for c in t["class_ids"] if c in names)
+        tasks.append({
+            "id": t["id"], "kind": "t1", "name": t.get("name", label),
+            "zh": label,
+            "banner": t.get("banner", ""),
+            "criteria": t.get("criteria", ""),
+            "class_ids": list(t["class_ids"]),
+            "degrade": list(t.get("degrade") or []),
+        })
+    return tasks
+
+
+def gen_t2_tasks(ws):
+    cfg = ws.get("config") or {}
+    rules = cfg.get("t2_rules") or {}
+    batch_dir = ws.get("batch_dir")
+    tasks = []
+    if batch_dir and os.path.isdir(batch_dir):
+        files = sorted(glob.glob(os.path.join(batch_dir, "*.txt")))
+        for f in files:
+            ids = _batch_file_to_image_ids(ws, f)
+            if not ids:
+                continue
+            tasks.append({
+                "id": "t2-" + os.path.splitext(os.path.basename(f))[0],
+                "kind": "t2", "name": os.path.splitext(os.path.basename(f))[0],
+                "banner": "", "criteria": "", "class_ids": [], "degrade": [],
+                "batch_file": f, "_image_ids": ids,
+            })
+        if tasks:
+            return tasks
+    # 自算批次
+    return _auto_t2_tasks(ws, rules)
+
+
+def _batch_file_to_image_ids(ws, path):
+    rel_map = {}
+    for im in ws["images"]:
+        rel_map[im["rel_image"].replace("\\", "/")] = im["id"]
+    ids = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rel = line.split("\t")[0].strip().replace("\\", "/")
+            if rel in rel_map:
+                ids.append(rel_map[rel])
+    return ids
+
+
+def _auto_t2_tasks(ws, rules):
+    low_max = int(rules.get("low_box_max", 3))
+    high_min = int(rules.get("high_box_min", 30))
+    batch_size = int(rules.get("batch_size", 50))
+    low, high, rest = [], [], []
+    for im in ws["images"]:
+        n = im["orig_box_count"]
+        if n <= low_max:
+            low.append(im["id"])
+        elif n > high_min:
+            high.append(im["id"])
+        else:
+            rest.append(im["id"])
+    tasks = []
+    if low:
+        tasks.append({"id": "t2-auto-low", "kind": "t2", "name": f"低框数·细扫（≤{low_max}框）",
+                      "banner": "标得越少越可能漏标，逐图细扫", "criteria": "",
+                      "class_ids": [], "degrade": [], "_image_ids": low})
+    if high:
+        tasks.append({"id": "t2-auto-high", "kind": "t2", "name": f"高密度·细扫（>{high_min}框）",
+                      "banner": "框多易漏，重点查边缘截断目标与小目标", "criteria": "",
+                      "class_ids": [], "degrade": [], "_image_ids": high})
+    for i in range(0, len(rest), batch_size):
+        chunk = rest[i:i + batch_size]
+        tasks.append({"id": f"t2-auto-{i // batch_size + 1}", "kind": "t2",
+                      "name": f"常规·快扫 {i // batch_size + 1}（{len(chunk)}图）",
+                      "banner": "", "criteria": "",
+                      "class_ids": [], "degrade": [], "_image_ids": chunk})
+    return tasks
+
+
+def task_progress(ws, task):
+    pairs, _ = _task_image_ids(ws, task)
+    if task["kind"] == "t2":
+        ids = pairs
+        total = len(ids)
+        terminal = sum(1 for i in ids if ws["images_by_id"][i]["status"] in TERMINAL_STATUSES) \
+            if hasattr(ws, "images_by_id") else _count_terminal(ws, ids)
+        return {"total_images": total, "terminal_images": terminal,
+                "total_boxes": 0, "verified_boxes": 0}
+    ids = [p[0] for p in pairs]
+    target_class_ids = set(task["class_ids"])
+    total_boxes = verified_boxes = 0
+    for img_id, tids in pairs:
+        im = ws["images_by_id"][img_id] if hasattr(ws, "images_by_id") else _find_image(ws, img_id)
+        vb = set(im.get("verified_box_ids") or [])
+        for b in im["boxes"]:
+            if b["class_id"] in target_class_ids:
+                total_boxes += 1
+                if b["id"] in vb:
+                    verified_boxes += 1
+    terminal = _count_terminal(ws, ids)
+    return {"total_images": len(ids), "terminal_images": terminal,
+            "total_boxes": total_boxes, "verified_boxes": verified_boxes}
+
+
+def _find_image(ws, img_id):
+    for im in ws["images"]:
+        if im["id"] == img_id:
+            return im
+    return None
+
+
+def _count_terminal(ws, ids):
+    n = 0
+    for i in ids:
+        im = _find_image(ws, i)
+        if im and im["status"] in TERMINAL_STATUSES:
+            n += 1
+    return n
+
+
+def all_tasks(ws):
+    """返回 {t1:[...], t2:[...]}，每个任务带进度统计。"""
+    ws["images_by_id"] = {im["id"]: im for im in ws["images"]}
+    out = {"t1": [], "t2": []}
+    for t in gen_t1_tasks(ws):
+        t["progress"] = task_progress(ws, t)
+        out["t1"].append(t)
+    for t in gen_t2_tasks(ws):
+        t["progress"] = task_progress(ws, t)
+        out["t2"].append(t)
+    return out
+
+
+def task_images(ws, task_id, offset=0, limit=50):
+    """任务图队列：未终态图排前。返回 {total, images:[...]}。"""
+    ws["images_by_id"] = {im["id"]: im for im in ws["images"]}
+    tasks = gen_t1_tasks(ws) + gen_t2_tasks(ws)
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if task is None:
+        raise KeyError(f"任务不存在: {task_id}")
+    pairs, _ = _task_image_ids(ws, task)
+    if task["kind"] == "t2":
+        rows = [(pid, []) for pid in pairs]
+    else:
+        rows = pairs
+    rows.sort(key=lambda r: 0 if ws["images_by_id"][r[0]]["status"] in TERMINAL_STATUSES else 1)
+    total = len(rows)
+    page = rows[offset:offset + limit]
+    out = []
+    for img_id, tids in page:
+        im = ws["images_by_id"][img_id]
+        out.append({
+            "img_id": img_id, "name": im["name"], "split": im["split"],
+            "box_count": len(im["boxes"]),
+            "target_box_ids": tids,
+            "target_count": len(tids),
+            "status": im["status"], "note": im["note"],
+            "has_changes": _img_changed(im),
+        })
+    return {"total": total, "images": out}
+
+
+def _img_changed(im):
+    return any(b.get("changed") or b.get("is_new") for b in im["boxes"]) or \
+        len(im["boxes"]) != len(im["orig_boxes"])

@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "palette": {
+    "default": "#64748B",
+    "identity_emphasis": true
+  },
+  "classes": [
+    {"id": 0,  "name": "builder",                         "zh": "施工人员",     "color": "#F97316", "identity": false, "focus": true},
+    {"id": 1,  "name": "cone_barrel",                     "zh": "交通锥桶",     "color": "#A8A29E", "identity": false, "focus": false},
+    {"id": 2,  "name": "person",                          "zh": "行人",         "color": "#EAB308", "identity": false, "focus": true},
+    {"id": 3,  "name": "spills",                          "zh": "抛洒物",       "color": "#B45309", "identity": false, "focus": false},
+    {"id": 4,  "name": "traffic_police",                  "zh": "交警",         "color": "#EF4444", "identity": true,  "focus": true},
+    {"id": 5,  "name": "tripod",                          "zh": "三角警示牌",   "color": "#94A3B8", "identity": false, "focus": false},
+    {"id": 6,  "name": "anti_collision_vehicle",          "zh": "防撞车",       "color": "#F59E0B", "identity": true,  "focus": true},
+    {"id": 7,  "name": "coach",                           "zh": "客车",         "color": "#10B981", "identity": false, "focus": true},
+    {"id": 8,  "name": "dangerous_goods_vehicle",         "zh": "危险品运输车", "color": "#DC2626", "identity": true,  "focus": true},
+    {"id": 9,  "name": "maintenance_construction_vehicle","zh": "养护施工车",   "color": "#FB923C", "identity": true,  "focus": true},
+    {"id": 10, "name": "motorcycle",                      "zh": "禁入车",       "color": "#EC4899", "identity": false, "focus": true},
+    {"id": 11, "name": "police_car",                      "zh": "警车",         "color": "#2563EB", "identity": true,  "focus": true},
+    {"id": 12, "name": "sedan",                           "zh": "轿车",         "color": "#64748B", "identity": false, "focus": false},
+    {"id": 13, "name": "truck",                           "zh": "卡车",         "color": "#78716C", "identity": false, "focus": false},
+    {"id": 14, "name": "tyre",                            "zh": "轮胎",         "color": "#57534E", "identity": false, "focus": false},
+    {"id": 15, "name": "canvas",                          "zh": "篷布",         "color": "#8B5CF6", "identity": false, "focus": false},
+    {"id": 16, "name": "carton",                          "zh": "纸箱",         "color": "#A16207", "identity": false, "focus": false},
+    {"id": 17, "name": "water_filled_barrier",            "zh": "水马",         "color": "#0EA5E9", "identity": false, "focus": false},
+    {"id": 18, "name": "ambulance",                       "zh": "救护车",       "color": "#F43F5E", "identity": true,  "focus": true},
+    {"id": 19, "name": "medical_person",                  "zh": "医护人员",     "color": "#14B8A6", "identity": true,  "focus": true},
+    {"id": 20, "name": "fire_fighting_truck",             "zh": "消防车",       "color": "#E11D48", "identity": true,  "focus": true},
+    {"id": 21, "name": "bird",                            "zh": "鸟",           "color": "#84CC16", "identity": false, "focus": false},
+    {"id": 22, "name": "monitor",                         "zh": "监控设备",     "color": "#7C3AED", "identity": false, "focus": false}
+  ],
+  "t1_tasks": [
+    {
+      "id": "t1-1", "name": "交警 traffic_police", "class_ids": [4],
+      "banner": "仅黄反光服≠交警",
+      "criteria": "须见反光背心 + 警帽/警徽/背心'警察'字样之一；施工场景+安全帽 → builder；否则 → person",
+      "degrade": [0, 2]
+    },
+    {
+      "id": "t1-2", "name": "警车 police_car", "class_ids": [11],
+      "banner": "无警用标识 → sedan",
+      "criteria": "蓝白警用涂装 + 警徽/公安·警察字样/警灯至少一项；仅蓝白双色无标识 → sedan",
+      "degrade": [12]
+    },
+    {
+      "id": "t1-3", "name": "危险品运输车 dangerous_goods_vehicle", "class_ids": [8],
+      "banner": "仅罐车外形 → truck",
+      "criteria": "须见危险品菱形标牌或罐体+警示标识；无标牌 → truck",
+      "degrade": [13]
+    },
+    {
+      "id": "t1-4", "name": "养护施工车 maintenance_construction_vehicle", "class_ids": [9],
+      "banner": "普通货车 → truck",
+      "criteria": "工程黄/橙涂装 + 作业警示（箭头灯板/施工标志/警示条纹/锥桶作业区/专用作业车结构）；普通货车停在作业区旁 → truck",
+      "degrade": [13]
+    },
+    {
+      "id": "t1-5", "name": "防撞车 anti_collision_vehicle", "class_ids": [6],
+      "banner": "须见缓冲垫/箭头灯板",
+      "criteria": "尾部防撞缓冲垫(TMA)或可展开箭头导向灯板；仅工程黄涂装不足为凭",
+      "degrade": [9, 13]
+    },
+    {
+      "id": "t1-6", "name": "客车 coach", "class_ids": [7],
+      "banner": "厢式货车 → truck",
+      "criteria": "车身多排侧窗 + 乘客门、无开放货厢；厢式货车（无窗/少窗）→ truck",
+      "degrade": [13]
+    },
+    {
+      "id": "t1-7", "name": "摩托车/禁入车 motorcycle", "class_ids": [10],
+      "banner": "业务禁入车定义，非英文词义",
+      "criteria": "车型是否属禁入范围不清楚 → 待裁决交统筹",
+      "degrade": []
+    },
+    {
+      "id": "t1-8", "name": "救护车/消防车 ambulance/fire_truck", "class_ids": [18, 20],
+      "banner": "罕见类：同时留意全包漏标",
+      "criteria": "救护车：白车身+红十字/生命之星+警灯；消防车：红色+水罐/云梯",
+      "degrade": [12, 13]
+    },
+    {
+      "id": "t1-9", "name": "施工人员 builder", "class_ids": [0],
+      "banner": "无工装证据 → person",
+      "criteria": "安全帽/工装/反光马甲 + 施工作业行为；不得把仅黄反光服者升为交警",
+      "degrade": [2]
+    },
+    {
+      "id": "t1-10", "name": "行人 person", "class_ids": [2],
+      "banner": "是否实为交警/builder/医护",
+      "criteria": "无职业标识兜底类；重点检查被降级漏改的身份目标",
+      "degrade": [0, 4, 19]
+    }
+  ],
+  "t2_rules": {
+    "batch_dir": null,
+    "low_box_max": 3,
+    "low_scan": "细扫",
+    "high_box_min": 30,
+    "high_scan": "细扫",
+    "batch_size": 50,
+    "regular_scan": "快扫"
+  },
+  "boundary_tolerance_px": 2,
+  "move_epsilon": 0.0005,
+  "export": {
+    "strict": false,
+    "copy_images": true,
+    "csv_bom": true,
+    "decimals": 6
+  },
+  "ui": {
+    "prefetch_next": 1,
+    "autosave_ms": 500,
+    "undo_limit": 50
+  }
+}

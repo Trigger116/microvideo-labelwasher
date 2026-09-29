@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>图片清洗工具 · microvideo-labelwasher</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">🖼️ 图片清洗工具 <span class="sub">microvideo-labelwasher</span></div>
+  <nav id="view-tabs">
+    <button data-view="packages" class="tab active">📦 数据包</button>
+    <button data-view="review" class="tab" disabled>🔍 审查</button>
+    <button data-view="export" class="tab" disabled>📤 导出</button>
+  </nav>
+  <div class="top-right">
+    <span id="ws-indicator" class="muted">未打开工作区</span>
+    <button id="btn-close-ws" class="ghost hidden">关闭工作区</button>
+  </div>
+</header>
+
+<main>
+  <!-- ============ 数据包视图 ============ -->
+  <section id="view-packages" class="view">
+    <div class="cols">
+      <div class="col left">
+        <h2>1 · 选择输入数据包</h2>
+        <div id="fs-nav">
+          <button id="fs-up" class="ghost" title="上一级">⬆</button>
+          <span id="fs-path" class="mono">—</span>
+        </div>
+        <ul id="fs-dirs" class="dirlist"></ul>
+        <div class="actions">
+          <button id="btn-scan" class="primary" disabled>扫描选中目录</button>
+        </div>
+        <div id="scan-result" class="hidden">
+          <h2>2 · 扫描结果</h2>
+          <div id="scan-detail"></div>
+          <div class="actions">
+            <label>批次目录 <input id="batch-dir" class="mono" style="width:280px" placeholder="留空=自动探测 plan/batches"></label>
+            <label>输出目录 <input id="output-dir" class="mono" style="width:280px" placeholder="留空=自动 <root>_done"></label>
+            <button id="btn-create-ws" class="primary">创建审查工作区</button>
+          </div>
+        </div>
+      </div>
+      <div class="col right">
+        <h2>3 · 已有工作区</h2>
+        <ul id="ws-list" class="dirlist"></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 审查视图 ============ -->
+  <section id="view-review" class="view hidden">
+    <div class="review-layout">
+      <aside id="task-panel">
+        <div class="task-head">
+          <h2>任务</h2>
+          <div class="mini">
+            <span>总进度</span>
+            <div class="bar"><div id="global-progress-fill" class="fill"></div></div>
+            <span id="global-progress-text">0/0</span>
+          </div>
+        </div>
+        <div id="task-list"></div>
+      </aside>
+      <section id="image-area">
+        <div id="task-banner"></div>
+        <div id="img-nav">
+          <button id="btn-prev" title="上一张 (←)">←</button>
+          <span id="img-pos">0 / 0</span>
+          <button id="btn-next" title="下一张 (→)">→</button>
+          <span id="img-name" class="mono"></span>
+          <button id="btn-reset-img" class="ghost hidden" title="恢复原始标注">恢复原框</button>
+          <button id="btn-mode" class="mode-btn" title="空格切换">浏览模式</button>
+        </div>
+        <div id="canvas-wrap">
+          <canvas id="main-canvas"></canvas>
+          <div id="canvas-hint" class="hint"></div>
+        </div>
+        <div id="status-bar">
+          <span class="status-btns">
+            <button data-status="已核验无修改" class="sbtn" title="S">✅ 已核验无修改</button>
+            <button data-status="已修改" class="sbtn warn" title="S">✏️ 已修改</button>
+            <button data-status="待裁决" class="sbtn arb" title="S">⚖️ 待裁决</button>
+          </span>
+          <input id="img-note" placeholder="备注/修改说明（如：仅黄反光服 交警→builder）" style="flex:1">
+          <span id="save-badge" class="badge">已保存</span>
+        </div>
+      </section>
+      <aside id="crop-panel">
+        <div class="crop-head">
+          <h2>裁剪框</h2>
+          <div id="crop-toolbar"></div>
+        </div>
+        <div id="crop-grid"></div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ============ 导出视图 ============ -->
+  <section id="view-export" class="view hidden">
+    <h2>审计报告与导出</h2>
+    <div class="actions">
+      <label><input type="checkbox" id="export-strict"> 严格模式（存在"未复核"图片时拒绝导出）</label>
+      <button id="btn-refresh-report" class="ghost">刷新报告</button>
+      <button id="btn-export" class="primary">📤 导出 done 包</button>
+      <span id="export-output" class="mono muted"></span>
+    </div>
+    <div id="export-overlay" class="overlay hidden"><div class="spin"></div><p>正在导出（复制图片约需 1–2 分钟），请勿关闭…</p></div>
+    <div id="report-area"></div>
+  </section>
+</main>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+
+<script src="/static/api.js"></script>
+<script src="/static/image_store.js"></script>
+<script src="/static/canvas_view.js"></script>
+<script src="/static/crop_panel.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
