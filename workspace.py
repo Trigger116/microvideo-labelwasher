@@ -123,6 +123,7 @@ def create_workspace(scan, ws_root, config_override=None, batch_dir=None, output
         "config": cfg,
         "batch_dir": batch_dir,
         "images": images,
+        "ui": {"last_task_id": None, "last_img_id": None},   # 中断恢复：上次处理位置（任务+图片）
         "_save_count": 0,
         "_clamp_dropped": clamp_dropped,
     }

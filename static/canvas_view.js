@@ -31,7 +31,7 @@ const CanvasView = (() => {
   let hintEl = null;
   let viewMode = "full";          // full | focus（定位轮播）
   let cropBoxId = null;           // 定位轮播当前框
-  let cropInfo = { index: 0, total: 0 };
+  let cropInfo = { index: 0, total: 0, nav: "Q/E 上一/下一框" };
 
   /* ---------------- 初始化 ---------------- */
   function init(cv, wrapEl, cb) {
@@ -65,14 +65,17 @@ const CanvasView = (() => {
     viewMode = m;
     if (m === "focus") {
       cropBoxId = boxId || cropBoxId;
-      cropInfo = { index: index || cropInfo.index, total: total || cropInfo.total };
+      cropInfo = { index: index || cropInfo.index, total: total || cropInfo.total, nav: cropInfo.nav };
     }
     updateHint();
     render();
   }
-  function setCropBox(boxId, index, total) {
+  function setCropBox(boxId, index, total, nav) {
     cropBoxId = boxId;
-    cropInfo = { index: index || cropInfo.index, total: total || cropInfo.total };
+    cropInfo = {
+      index: index || cropInfo.index, total: total || cropInfo.total,
+      nav: nav || cropInfo.nav || "Q/E 上一/下一框",
+    };
     if (viewMode === "focus") { updateHint(); render(); }
   }
   function getViewMode() { return viewMode; }
@@ -80,7 +83,7 @@ const CanvasView = (() => {
   function updateHint() {
     if (!hintEl) return;
     if (viewMode === "focus") {
-      hintEl.textContent = `🔍 定位轮播 ${cropInfo.index}/${cropInfo.total} · Q/E 上一/下一框 · 滚轮缩放 · W 回全图`;
+      hintEl.textContent = `🔍 定位轮播 ${cropInfo.index}/${cropInfo.total} · ${cropInfo.nav} · 滚轮缩放 · W 回全图`;
       hintEl.className = "hint focus";
       return;
     }

@@ -190,6 +190,7 @@ def create_app(ws_root=None, port_file=None):
             "stats": st,
             "tasks": tasks_all,
             "classes": ws["package"]["classes"],
+            "ui": ws.get("ui") or {"last_task_id": None, "last_img_id": None},
         })
 
     @app.delete("/api/workspaces/<ws_id>")
@@ -217,6 +218,18 @@ def create_app(ws_root=None, port_file=None):
         ws["config"] = new_cfg
         store.save(ws)
         return jsonify({"config": new_cfg})
+
+    @app.put("/api/workspaces/<ws_id>/ui")
+    def put_ws_ui(ws_id):
+        """中断恢复：保存上次处理位置（last_task_id / last_img_id，任一可空）。"""
+        ws = store.get(ws_id)
+        d = request.get_json(silent=True) or {}
+        ui = ws.get("ui") or {"last_task_id": None, "last_img_id": None}
+        ui["last_task_id"] = d.get("last_task_id", ui.get("last_task_id"))
+        ui["last_img_id"] = d.get("last_img_id", ui.get("last_img_id"))
+        ws["ui"] = ui
+        store.save(ws)
+        return jsonify({"ui": ui})
 
     # ---------- 任务 ----------
     @app.get("/api/workspaces/<ws_id>/tasks")

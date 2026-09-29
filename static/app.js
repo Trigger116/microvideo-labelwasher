@@ -199,6 +199,11 @@ const App = (() => {
       updateTabs();
       setView("review");
       renderTasks(r.stats, r.tasks);
+      // 中断恢复：优先回到上次处理位置（任务 + 图；任务/图已不存在则静默回退）
+      const ui = r.ui || {};
+      const lastTask = ui.last_task_id
+        ? [...r.tasks.t1, ...r.tasks.t2].find(t => t.id === ui.last_task_id) : null;
+      if (lastTask) { await setTask(lastTask.id, r.tasks, ui.last_img_id || null); return; }
       // 默认打开第一个未完成任务
       const first = [...r.tasks.t1, ...r.tasks.t2].find(t =>
         (t.kind === "t1" ? t.progress.verified_boxes < t.progress.total_boxes
@@ -245,8 +250,9 @@ const App = (() => {
         const li = document.createElement("div");
         li.className = "task-item" + (t.id === state.taskId ? " active" : "") + (done >= total ? " done" : "");
         const pct = total ? Math.round(done / total * 100) : 100;
+        const lastTaskId = (state.wsMeta && state.wsMeta.ui && state.wsMeta.ui.last_task_id) || null;
         li.innerHTML = `
-          <div class="tname">${t.name}</div>
+          <div class="tname">${t.id === lastTaskId ? "📌 " : ""}${t.name}</div>
           <div class="tmeta">${t.kind === "t1"
             ? `框 ${t.progress.verified_boxes}/${t.progress.total_boxes} · 图 ${t.progress.terminal_images}/${t.progress.total_images}`
             : `图 ${t.progress.terminal_images}/${t.progress.total_images}`}</div>
@@ -263,7 +269,7 @@ const App = (() => {
     return { t1: meta.t1 || [], t2: meta.t2 || [] };
   }
 
-  async function setTask(tid, tasksArg) {
+  async function setTask(tid, tasksArg, focusImgId) {
     await flush();
     try {
       const r = await Api.get(`/api/workspaces/${state.wsId}/tasks/${tid}/images?limit=500`);
@@ -280,7 +286,13 @@ const App = (() => {
           ? `<div class="focus">可疑目标可快速降级 ↓（裁剪面板按钮）</div>` : ""}`;
       renderTasks(state.wsMeta.stats, all);
       if (!r.images.length) { toast("该任务无图片", "warn"); return; }
-      await openQueueImage(0);
+      // 中断恢复：按 img_id 定位（队列排序可能变化，不能用 index）；不在队列则回退第一张
+      let idx = 0;
+      if (focusImgId) {
+        const i = r.images.findIndex(row => row.img_id === focusImgId);
+        if (i >= 0) idx = i;
+      }
+      await openQueueImage(idx);
     } catch (e) { toast(e.message, "error"); }
   }
 
@@ -396,6 +408,7 @@ const App = (() => {
       renderCrops();
       updateStatusUI();
       setBadge("saved");
+      saveUiPosition();   // 中断恢复：记录当前任务+图位置（异步静默）
       // 预取下一张
       if (state.queue[idx + 1]) ImageStore.prefetch(state.queue[idx + 1].img_id);
       // 定位轮播保持：新图从第一个轮播框开始（无可见框则回全图）
@@ -412,6 +425,17 @@ const App = (() => {
         if (t) { CanvasView.setSelected(t.id); CropPanel.setSelected(t.id); }
       }
     } catch (e) { toast(e.message, "error"); }
+  }
+
+  /* 保存上次处理位置（中断恢复用）；失败静默，下次翻图会重试 */
+  function saveUiPosition() {
+    if (!state.wsId || !state.taskId || !state.image) return;
+    fetch(`/api/workspaces/${state.wsId}/ui`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ last_task_id: state.taskId, last_img_id: state.image.img.id }),
+      keepalive: true,
+    }).catch(() => {});
   }
 
   async function navImage(delta) {
@@ -740,7 +764,9 @@ const App = (() => {
     const i = Math.max(0, ids.indexOf(boxId));
     CanvasView.setSelected(boxId);
     CropPanel.setSelected(boxId);
-    CanvasView.setCropBox(boxId, i + 1, ids.length);
+    // T1 任务下 E=核验过框，hint 明示；T2/无任务为纯轮播
+    const t1 = state.task && state.task.kind === "t1";
+    CanvasView.setCropBox(boxId, i + 1, ids.length, t1 ? "E 核验·下一框 · Q 上一框" : "Q/E 上一/下一框");
     CanvasView.setViewMode("focus");
     CanvasView.focusBox(boxId, true);   // 视口定位放大到该框（居中 + 框宽 2.2 倍适配，≤6 倍）
   }
@@ -762,6 +788,11 @@ const App = (() => {
     const ids = cropOrder();
     if (!ids.length) return;
     const inFocus = CanvasView.getViewMode() === "focus";
+    // T1 定位轮播：E = 当前框处理完毕（核验 ✓，无论是否修改），跳到下一个未核验框
+    if (inFocus && dir > 0 && state.task && state.task.kind === "t1") {
+      stepCropVerify();
+      return;
+    }
     let i = ids.indexOf(inFocus ? CanvasView.getCropBox() : CanvasView.getSelected());
     if (i < 0) i = dir > 0 ? -1 : 0;
     i = (i + dir + ids.length) % ids.length;   // 循环轮播
@@ -774,6 +805,44 @@ const App = (() => {
       CropPanel.setSelected(id);
       CanvasView.focusBox(id, true);
     }
+  }
+
+  /* T1 定位轮播 E：核验当前框（只加不删）→ 跳到下一个未核验框；全部核验完 toast 并停在当前框 */
+  async function stepCropVerify() {
+    const ids = cropOrder();
+    if (!ids.length) return;
+    const cur = CanvasView.getCropBox();
+    if (!cur || !ids.includes(cur)) return;
+    await markVerified(cur);
+    const vb = new Set(state.image.verified_box_ids);
+    const rest = ids.filter(id => !vb.has(id));
+    if (!rest.length) { toast("本图目标框已全部核验 ✓", "ok"); return; }
+    // 从当前框位置向后循环找下一个未核验框
+    let i = ids.indexOf(cur), next = null;
+    for (let n = 1; n <= ids.length; n++) {
+      const cand = ids[(i + n) % ids.length];
+      if (!vb.has(cand)) { next = cand; break; }
+    }
+    if (next) enterCrop(next);
+  }
+
+  /* 框级核验（只加不删；撤销核验用裁剪面板 ✓ toggle） */
+  async function markVerified(boxId) {
+    if (!state.image) return;
+    const ids = new Set(state.image.verified_box_ids);
+    if (ids.has(boxId)) return;   // 已核验，无需重复保存
+    ids.add(boxId);
+    state.image.verified_box_ids = [...ids];
+    try {
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
+        status: state.image.status,
+        note: $("#img-note").value,
+        verified_box_ids: state.image.verified_box_ids,
+      });
+      state.image.note = r.note;
+      renderCrops();
+      await refreshProgress();
+    } catch (e) { toast(e.message, "error"); }
   }
 
   /* ============ 键盘快捷键 ============ */
@@ -1003,6 +1072,8 @@ const App = (() => {
     $("#img-note").addEventListener("input", scheduleNoteSave);
     $("#btn-arb").addEventListener("click", toggleArb);
     document.addEventListener("keydown", onKey);
+    // 中断恢复兜底：页面关闭/刷新前把当前位置带上（keepalive 同步发出）
+    window.addEventListener("beforeunload", () => { saveUiPosition(); });
 
     // Canvas 回调
     CanvasView.init($("#main-canvas"), $("#canvas-wrap"), {
