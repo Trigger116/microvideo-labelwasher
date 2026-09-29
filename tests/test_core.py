@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """核心单元测试：io_utils / packages / workspace / diffs / tasks / export。
 
-真实包断言（若存在）；迷你 fixture 包断言（始终运行）。
+迷你 fixture 包断言始终运行；真实包断言由环境变量驱动（未设置则跳过）：
+  LABELWASH_REAL_PKG_ROOT  真实数据包所在根目录（其下含数据包子目录）
+  LABELWASH_REAL_PKG_SUB   数据包子目录名
+  LABELWASH_BATCH_DIR      T2 批次清单目录（可选，配合前两者使用）
 """
 import copy
 import os
@@ -21,10 +24,10 @@ import tasks
 import workspace
 from make_fixture import make_fixture
 
-REAL_ROOT = r"D:\research\project\0928\review_0tya"
-REAL_SUB = "review_04"
-BATCH_DIR = r"D:\research\project\0928\plan\batches"
-HAS_REAL = os.path.isdir(os.path.join(REAL_ROOT, REAL_SUB))
+REAL_ROOT = os.environ.get("LABELWASH_REAL_PKG_ROOT", "")
+REAL_SUB = os.environ.get("LABELWASH_REAL_PKG_SUB", "")
+BATCH_DIR = os.environ.get("LABELWASH_BATCH_DIR", "")
+HAS_REAL = bool(REAL_ROOT and REAL_SUB and os.path.isdir(os.path.join(REAL_ROOT, REAL_SUB)))
 
 
 class TestIoUtils(unittest.TestCase):
@@ -38,10 +41,11 @@ class TestIoUtils(unittest.TestCase):
         self.assertEqual(io_utils.read_text(p), "中文")
 
     def test_path_guard(self):
-        self.assertTrue(io_utils.is_within(r"D:\a\b\c", r"D:\a"))
-        self.assertFalse(io_utils.is_within(r"D:\a_done", r"D:\a"))
+        d = tempfile.mkdtemp()
+        self.assertTrue(io_utils.is_within(os.path.join(d, "a", "b", "c"), d))
+        self.assertFalse(io_utils.is_within(d + "_done", d))
         with self.assertRaises(ValueError):
-            io_utils.assert_paths_safe(r"D:\a", r"D:\a\out")
+            io_utils.assert_paths_safe(d, os.path.join(d, "out"))
 
     def test_fmt_float(self):
         self.assertEqual(io_utils.fmt_float(0.4574219999), "0.457422")

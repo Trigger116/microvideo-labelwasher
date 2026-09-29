@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Flask app 工厂 + 全部 REST API（薄层：解析参数、调 service、统一错误）。"""
 import os
+import subprocess
 import threading
 import time
 
@@ -93,6 +94,31 @@ def create_app(ws_root=None, port_file=None):
         return jsonify({"path": path, "parent": parent,
                         "drives": _list_drives(), "dirs": dirs,
                         "self_is_pkg": os.path.exists(os.path.join(path, "classes.txt"))})
+
+    @app.post("/api/fs/pick")
+    def fs_pick():
+        """弹出 Windows 原生目录选择对话框，返回所选路径（取消返回 null）。"""
+        if os.name != "nt":
+            return api_error("E_UNSUPPORTED", "目录选择器仅支持 Windows", 400)
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            "$d.Description = '选择输入数据包所在目录';"
+            "$d.ShowNewFolderButton = $false;"
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {"
+            " [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $d.SelectedPath }"
+        )
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-Command", script],
+                capture_output=True, timeout=600, text=True, encoding="utf-8", errors="replace",
+            )
+        except Exception:
+            return api_error("E_PICK_FAILED", "目录选择失败", 500)
+        path = (r.stdout or "").strip().strip('"')
+        if not path or r.returncode != 0:
+            return jsonify({"path": None})
+        return jsonify({"path": path})
 
     # ---------- 包扫描 ----------
     @app.post("/api/packages/scan")

@@ -166,7 +166,7 @@ const CanvasView = (() => {
   /* ---------------- 渲染 ---------------- */
   function chipText(b) {
     const c = classById[b.class_id];
-    return c ? (c.zh || c.name) : "?" + b.class_id;
+    return c ? c.name : "?" + b.class_id;
   }
   function chipColor(b) {
     const c = classById[b.class_id];
@@ -323,7 +323,7 @@ const CanvasView = (() => {
           startImg: iv, startScreen: p,
         };
       } else {
-        drag = { kind: "pan", start: p, moved: false, startOx: ox, startOy: oy };
+        drag = { kind: "pan", startScreen: p, moved: false, startOx: ox, startOy: oy };
       }
     } else {
       selectedId = null;
@@ -336,7 +336,7 @@ const CanvasView = (() => {
           classId: callbacks.defaultNewClass ? callbacks.defaultNewClass() : 2,
         };
       } else {
-        drag = { kind: "pan", start: p, moved: false, startOx: ox, startOy: oy };
+        drag = { kind: "pan", startScreen: p, moved: false, startOx: ox, startOy: oy };
       }
     }
     canvas.setPointerCapture(e.pointerId);

@@ -94,7 +94,7 @@ const App = (() => {
         li.addEventListener("click", async () => {
           if (d.is_pkg) {
             // 单击数据包 = 直接扫描：root=父目录 + subdir=包名，
-            // 输出默认 <root>_done/<subdir>（如 review_0tya_done/review_04，结构与输入一致）
+            // 输出默认 <root>_done/<subdir>（如 <数据根>_done/<包名>，结构与输入一致）
             const detail = await doScan(r.path, d.name);
             if (detail) showScanResult(detail);
           } else {
@@ -559,9 +559,9 @@ const App = (() => {
     const cur = state.image.boxes.find(b => b.id === boxId);
     const curId = cur ? cur.class_id : state.lastNewClass;
     openModal(`
-      <h3>${title || "选择类别"}（当前：${cls[curId] ? cls[curId].zh : "?"}）</h3>
+      <h3>${title || "选择类别"}（当前：${cls[curId] ? cls[curId].name : "?"}）</h3>
       <div class="class-pick">${cls.map((c, i) =>
-        `<button data-cid="${i}" style="border-left-color:${c.color}">${i}·${c.zh || c.name}${
+        `<button data-cid="${i}" style="border-left-color:${c.color}">${i}·${c.name}${
           c.focus ? " ⭐" : ""}</button>`).join("")}</div>
       <div class="modal-btns"><button class="ghost" onclick="App.closeModal()">取消</button></div>`);
     for (const btn of document.querySelectorAll(".class-pick button")) {
@@ -569,7 +569,7 @@ const App = (() => {
       btn.addEventListener("click", async () => {
         closeModal();
         if (boxId) await changeBoxClass(boxId, +btn.dataset.cid);
-        else { state.lastNewClass = +btn.dataset.cid; toast(`新框默认类 → ${cls[+btn.dataset.cid].zh}`, "ok"); }
+        else { state.lastNewClass = +btn.dataset.cid; toast(`新框默认类 → ${cls[+btn.dataset.cid].name}`, "ok"); }
       });
     }
   }
@@ -595,7 +595,7 @@ const App = (() => {
     await changeBoxClass(boxId, targetClassId);
     await toggleVerified(boxId);
     const tc = state.wsMeta.classes.find(c => c.id === targetClassId);
-    toast(`已降级为 ${tc ? tc.zh : targetClassId} 并标记核验`, "ok");
+    toast(`已降级为 ${tc ? tc.name : targetClassId} 并标记核验`, "ok");
   }
 
   function contextMenu(boxId, x, y) {
@@ -607,11 +607,11 @@ const App = (() => {
     menu.style.left = x + "px"; menu.style.top = y + "px";
     const items = [];
     if (cur) {
-      items.push(`<button id="cm-class">✏️ 改类（当前 ${cls[cur.class_id] ? cls[cur.class_id].zh : "?"}）</button>`);
+      items.push(`<button id="cm-class">✏️ 改类（当前 ${cls[cur.class_id] ? cls[cur.class_id].name : "?"}）</button>`);
       items.push(`<button id="cm-verify">${state.image.verified_box_ids.includes(boxId) ? "↩ 取消框级核验" : "✓ 标记框已核验"}</button>`);
       items.push(`<button id="cm-delete" class="danger">🗑 删除框</button>`);
     } else {
-      items.push(`<button id="cm-newclass">✏️ 设置新框默认类（当前 ${cls[state.lastNewClass] ? cls[state.lastNewClass].zh : "?"}）</button>`);
+      items.push(`<button id="cm-newclass">✏️ 设置新框默认类（当前 ${cls[state.lastNewClass] ? cls[state.lastNewClass].name : "?"}）</button>`);
     }
     items.push(`<button id="cm-arb">⚖️ 图片标为待裁决</button>`);
     menu.innerHTML = items.join('<div class="sep"></div>');
@@ -685,7 +685,7 @@ const App = (() => {
       if (cid >= cls.length) return;
       if (e.shiftKey) {
         state.lastNewClass = cid;
-        toast(`新框默认类 → ${cls[cid].zh}`, "ok");
+        toast(`新框默认类 → ${cls[cid].name}`, "ok");
       } else {
         const s = CanvasView.getSelected();
         if (s) changeBoxClass(s, cid);
@@ -832,6 +832,12 @@ const App = (() => {
     $("#fs-up").addEventListener("click", async () => {
       const r = await Api.post("/api/fs/browse", { path: state.fsPath });
       if (r.parent) browseFs(r.parent);
+    });
+    $("#btn-pick").addEventListener("click", async () => {
+      try {
+        const r = await Api.post("/api/fs/pick");
+        if (r.path) browseFs(r.path);
+      } catch (e) { toast(e.message, "error"); }
     });
     $("#btn-scan").addEventListener("click", async () => {
       const r = await Api.post("/api/packages/scan", { root: state.fsPath, subdir: "__self__" });

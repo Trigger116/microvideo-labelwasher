@@ -8,7 +8,7 @@
 ### 方式一：打包版（无需 Python 环境）
 1. 解压 `dist/microvideo-labelwasher.zip`
 2. 双击 `microvideo-labelwasher.exe`（自动打开浏览器 http://127.0.0.1:PORT）
-3. 首次使用：浏览到数据包父目录 → 单击数据包（📦 标记）→ 创建审查工作区
+3. 首次使用：点击 📂 打开文件夹（本地目录选择器）或逐级浏览到数据包父目录 → 单击数据包（📦 标记）→ 创建审查工作区
 
 ### 方式二：源码运行
 ```bash
@@ -20,19 +20,19 @@ python main.py                          # 或 python main.py --port 8899 --no-br
 
 ```
 输入（只读）:
-  review_0tya/
-    review_04/
+  <数据根>/
+    <包名>/
       classes.txt            类名（按行，ID 从 0 起）
       类别说明.csv            可选：class_id,english_name,中文参考
       复核记录.csv            可选：文件名,split,原始框数,状态,修改说明或疑问
       train/{images,labels}/  val/{images,labels}/    YOLO 标签: class cx cy w h
 
 工作区（工具写入）:
-  tools/microvideo-labelwasher/workspaces/ws_YYYYmmdd_HHMMSS/workspace.json  原子写入 + 50 次/份滚动备份
+  workspaces/ws_YYYYmmdd_HHMMSS/workspace.json  原子写入 + 50 次/份滚动备份
 
 输出:
-  review_0tya_done/
-    review_04/               结构与输入一致
+  <数据根>_done/
+    <包名>/                 结构与输入一致
       classes.txt / 类别说明.csv / 复核记录.csv（更新状态列）
       train|val/{images,labels}/   图片复制 + 清洗后标签（6 位小数）
 ```
@@ -43,7 +43,7 @@ python main.py                          # 或 python main.py --port 8899 --no-br
 |---|---|---|
 | 包扫描 | 自动检查：缺图/缺标签、坏行、越界框、类别分布 | 无预警或已了解 |
 | **T1 框级核验** | 10 个易混淆类别任务（交警/警车/危险品车/养护施工车/防撞车/客车/摩托/救护消防/施工人员/行人），判类证据准则显示在任务横幅；可疑目标用裁剪面板 **↓快速降级** | 每类框级 ✓ 全部核验 |
-| **T2 全图漏标扫视** | 13 个批次（与 plan/batches 同源）：低框数批次逐图细扫查漏标，高密度批次查边缘截断与小目标 | 每批全部终态 |
+| **T2 全图漏标扫视** | 批次（与 plan/batches 同源，无清单时按 t2_rules 自算）：低框数批次逐图细扫查漏标，高密度批次查边缘截断与小目标 | 每批全部终态 |
 | 审计导出 | 类别转换明细、增删框统计、待裁决清单；严格模式拒绝未复核残留 | 导出 `_done` 包 |
 
 图片状态机：`未复核 → 已核验无修改 / 已修改 / 待裁决`。
@@ -82,7 +82,7 @@ python main.py                          # 或 python main.py --port 8899 --no-br
 
 ## 配置（config.json）
 
-- `classes`：类别颜色/zh 名/`identity`（身份类）/`focus`（关注类）
+- `classes`：类别 `name`（英文名，界面标签展示）/`zh`（仅用于任务描述）/颜色/`identity`（身份类）/`focus`（关注类）
 - `t1_tasks`：任务 `class_ids` + `banner`（任务目标）+ `criteria`（判类证据）+ `degrade`（快速降级映射）
 - `t2_rules`：无批次清单时的自算规则（low_box_max / high_box_min / batch_size）
 - `boundary_tolerance_px` / `move_epsilon` / `export{strict, csv_bom, decimals}` / `ui{autosave_ms, undo_limit}`
@@ -92,7 +92,7 @@ python main.py                          # 或 python main.py --port 8899 --no-br
 ## 测试与构建
 
 ```bash
-python -m unittest tests.test_core        # 18 个单元/API 测试（含真实包断言）
+python -m unittest tests.test_core        # 18 个单元/API 测试（真实包断言由 LABELWASH_REAL_PKG_ROOT 等环境变量驱动，未设置自动跳过）
 build.bat                                  # PyInstaller onedir + zip
 ```
 

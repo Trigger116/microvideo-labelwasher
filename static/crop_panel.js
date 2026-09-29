@@ -63,7 +63,7 @@ const CropPanel = (() => {
     const name = document.createElement("div");
     name.className = "cname";
     name.style.color = c && c.color ? c.color : "#e2e8f0";
-    name.textContent = (c ? (c.zh || c.name) : "?") + (b.is_new ? " ✨新" : "");
+    name.textContent = (c ? c.name : "?") + (b.is_new ? " ✨新" : "");
     meta.appendChild(name);
     const sub = document.createElement("div");
     sub.className = "csub";
@@ -91,8 +91,8 @@ const CropPanel = (() => {
         const tc = classById[tcid];
         if (!tc) continue;
         const btn = document.createElement("button");
-        btn.textContent = "↓" + (tc.zh || tc.name);
-        btn.title = `快速降级为 ${tc.zh || tc.name}`;
+        btn.textContent = "↓" + tc.name;
+        btn.title = `快速降级为 ${tc.name}`;
         btn.addEventListener("click", (ev) => {
           ev.stopPropagation();
           if (callbacks.onDegrade) callbacks.onDegrade(b.id, tcid);
