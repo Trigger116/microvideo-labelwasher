@@ -807,7 +807,8 @@ const App = (() => {
     }
   }
 
-  /* T1 定位轮播 E：核验当前框（只加不删）→ 跳到下一个未核验框；全部核验完 toast 并停在当前框 */
+  /* T1 定位轮播 E：核验当前框（只加不删）→ 跳到下一个未核验框；本图全部核验完 → 自动翻下一图
+     并保持定位轮播定位到第一个特写框（图状态自动判定、位置记忆沿用翻图逻辑） */
   async function stepCropVerify() {
     const ids = cropOrder();
     if (!ids.length) return;
@@ -816,7 +817,15 @@ const App = (() => {
     await markVerified(cur);
     const vb = new Set(state.image.verified_box_ids);
     const rest = ids.filter(id => !vb.has(id));
-    if (!rest.length) { toast("本图目标框已全部核验 ✓", "ok"); return; }
+    if (!rest.length) {
+      // 本图目标框已全部核验 → 自动翻下一图（navImage 内含状态自动判定/保存/位置记忆/定位轮播保持）
+      const prevImg = state.image && state.image.img ? state.image.img.id : null;
+      await navImage(1);
+      if (state.image && state.image.img && state.image.img.id !== prevImg) {
+        toast("本图已核验完毕 ✓ → 下一图", "ok");
+      }   // 任务末尾时 navImage 已提示"已到末尾"，此处不重复提示
+      return;
+    }
     // 从当前框位置向后循环找下一个未核验框
     let i = ids.indexOf(cur), next = null;
     for (let n = 1; n <= ids.length; n++) {
