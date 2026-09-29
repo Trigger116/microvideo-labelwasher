@@ -150,7 +150,7 @@ const CropPanel = (() => {
     }
   }
 
-  /* 可见框列表：T1 只含任务关注类别；T2 全部框且重点类（focus）排前。轮播/特写/面板共用此顺序 */
+  /* 可见框列表：T1 只含任务关注类别；T2 全部框且重点类（focus）排前。轮播/定位/面板共用此顺序 */
   function visibleBoxes() {
     const task = opts.task;
     let arr = boxes.filter(b => !task || !task.class_ids.length || task.class_ids.includes(b.class_id));

@@ -144,7 +144,7 @@ h2:first-child { margin-top: 0; }
 }
 #canvas-hint.browse { color: var(--accent2); }
 #canvas-hint.annotate { color: var(--warn); }
-#canvas-hint.crop { color: var(--accent); }
+#canvas-hint.focus { color: var(--accent); }
 #status-bar { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
 #status-bar input {
   background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;

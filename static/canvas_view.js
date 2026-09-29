@@ -1,11 +1,11 @@
-/* canvas_view.js —— 主画布：渲染 + 浏览/标注双模式编辑 + 裁剪特写模式
+/* canvas_view.js —— 主画布：渲染 + 浏览/标注双模式编辑 + 定位轮播模式
  *
  * 坐标约定：视口 = {scale, ox, oy}，屏幕→图像: (sx-ox)/scale
  * 框坐标全部 0-1 归一化。渲染顺序：底图 → 框(描边2px/填充12%) → OOB虚线
  * → 已修改橙框 → 选中高亮+手柄 → 类名chip。
  * 命中顺序：resize手柄(8px) → 框内部 → 空白。
- * 特写模式（viewMode="crop"）：大画布 letterbox 渲染当前框外扩 1.8 倍裁剪，
- * 仅画当前框描边；禁用鼠标编辑（W 回全图，Q/E 换框）。
+ * 定位轮播（viewMode="focus"）：始终渲染整幅图，仅视口定位放大到当前框
+ * （app.js 调 focusBox），可自由缩放/平移（W 回全图，Q/E 换框）。
  */
 "use strict";
 
@@ -29,8 +29,8 @@ const CanvasView = (() => {
   let drag = null;                // 拖拽状态机
   let anim = null;                // focus 动画
   let hintEl = null;
-  let viewMode = "full";          // full | crop（裁剪特写）
-  let cropBoxId = null;           // 特写当前框
+  let viewMode = "full";          // full | focus（定位轮播）
+  let cropBoxId = null;           // 定位轮播当前框
   let cropInfo = { index: 0, total: 0 };
 
   /* ---------------- 初始化 ---------------- */
@@ -56,14 +56,14 @@ const CanvasView = (() => {
   /* ---------------- 状态设置 ---------------- */
   function setMode(m) {
     mode = m;
-    if (m === "annotate" && viewMode === "crop") setViewMode("full");  // 标注操作基于全图坐标
+    if (m === "annotate" && viewMode === "focus") setViewMode("full");  // 标注操作基于全图坐标
     canvas.style.cursor = mode === "annotate" ? "crosshair" : "grab";
     updateHint();
     render();
   }
   function setViewMode(m, boxId, index, total) {
     viewMode = m;
-    if (m === "crop") {
+    if (m === "focus") {
       cropBoxId = boxId || cropBoxId;
       cropInfo = { index: index || cropInfo.index, total: total || cropInfo.total };
     }
@@ -73,20 +73,20 @@ const CanvasView = (() => {
   function setCropBox(boxId, index, total) {
     cropBoxId = boxId;
     cropInfo = { index: index || cropInfo.index, total: total || cropInfo.total };
-    if (viewMode === "crop") { updateHint(); render(); }
+    if (viewMode === "focus") { updateHint(); render(); }
   }
   function getViewMode() { return viewMode; }
   function getCropBox() { return cropBoxId; }
   function updateHint() {
     if (!hintEl) return;
-    if (viewMode === "crop") {
-      hintEl.textContent = `🔍 裁剪特写 ${cropInfo.index}/${cropInfo.total} · Q/E 切换框 · W 回全图`;
-      hintEl.className = "hint crop";
+    if (viewMode === "focus") {
+      hintEl.textContent = `🔍 定位轮播 ${cropInfo.index}/${cropInfo.total} · Q/E 上一/下一框 · 滚轮缩放 · W 回全图`;
+      hintEl.className = "hint focus";
       return;
     }
     hintEl.textContent = mode === "annotate"
       ? "✏️ 标注模式：拖框移动 · 手柄缩放 · 空白拖拽画新框 · 右键=删除/改类"
-      : "🔍 浏览模式：滚轮缩放 · 拖拽平移 · 点击选择框 · W 特写";
+      : "🔍 浏览模式：滚轮缩放 · 拖拽平移 · 点击选择框 · W 定位";
     hintEl.className = "hint " + mode;
   }
   function setImage(im) { img = im; selectedId = null; updateHint(); fit(); }
@@ -215,7 +215,6 @@ const CanvasView = (() => {
     ctx.fillStyle = "#0a0d11";
     ctx.fillRect(0, 0, r.width, r.height);
     if (!img) return;
-    if (viewMode === "crop") { renderCrop(r); return; }
     const iw = img.width * scale, ih = img.height * scale;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
@@ -230,44 +229,6 @@ const CanvasView = (() => {
     if (selectedId) {
       const b = boxes.find(x => x.id === selectedId);
       if (b) drawHandles(b);
-    }
-  }
-
-  /* 特写渲染：当前框外扩 1.8 倍区域 letterbox 铺满画布，只画当前框 */
-  const CROP_PAD = 1.8;
-  function renderCrop(r) {
-    const b = boxes.find(x => x.id === cropBoxId);
-    if (!b) { viewMode = "full"; updateHint(); render(); return; }
-    const bw = b.w * img.width, bh = b.h * img.height;
-    const bx = (b.cx - b.w / 2) * img.width, by = (b.cy - b.h / 2) * img.height;
-    const sw = Math.min(img.width, bw * CROP_PAD);
-    const sh = Math.min(img.height, bh * CROP_PAD);
-    let sx = bx + bw / 2 - sw / 2, sy = by + bh / 2 - sh / 2;
-    sx = Math.max(0, Math.min(sx, img.width - sw));
-    sy = Math.max(0, Math.min(sy, img.height - sh));
-    const k = Math.min(r.width / sw, r.height / sh);
-    const dw = sw * k, dh = sh * k;
-    const dx = (r.width - dw) / 2, dy = (r.height - dh) / 2;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    try {
-      ctx.drawImage(img.bitmap, sx, sy, sw, sh, dx, dy, dw, dh);
-    } catch (err) { /* bitmap 已回收：跳过绘制 */ }
-
-    // 当前框描边（2.5px，白描 + 类色外圈）
-    const c = classById[b.class_id];
-    const color = c && c.color ? c.color : "#4f8cff";
-    const fx = dx + (bx - sx) * k, fy = dy + (by - sy) * k;
-    const fw = bw * k, fh = bh * k;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2.5;
-    ctx.strokeRect(fx, fy, fw, fh);
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(fx - 1, fy - 1, fw + 2, fh + 2);
-    if (b.changed || b.is_new) {  // 已修改角标
-      ctx.fillStyle = "#fb923c";
-      ctx.fillRect(fx, fy, 11, 11);
     }
   }
 
@@ -351,14 +312,12 @@ const CanvasView = (() => {
     canvas.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      if (viewMode === "crop") return;   // 特写模式无编辑菜单
       const p = mousePos(e);
       const b = hitBox(p.x, p.y);
       if (b) { selectedId = b.id; render(); }
       if (callbacks.onContextMenu) callbacks.onContextMenu(b ? b.id : null, e.clientX, e.clientY);
     });
     canvas.addEventListener("dblclick", (e) => {
-      if (viewMode === "crop") return;
       const p = mousePos(e);
       const b = hitBox(p.x, p.y);
       if (b) { selectedId = b.id; render(); }
@@ -368,7 +327,6 @@ const CanvasView = (() => {
 
   function onWheel(e) {
     e.preventDefault();
-    if (viewMode === "crop") return;    // 特写渲染固定适配，不缩放
     const p = mousePos(e);
     zoomAt(e.deltaY < 0 ? 1.18 : 1 / 1.18, p.x, p.y);
   }
@@ -376,7 +334,6 @@ const CanvasView = (() => {
   function onDown(e) {
     if (e.button !== 0) return;
     if (!img) return;
-    if (viewMode === "crop") return;    // 特写模式仅轮播查看
     const p = mousePos(e);
     const handle = mode === "annotate" ? hitHandle(p.x, p.y) : null;
     const b = mode === "annotate" || mode === "browse" ? hitBox(p.x, p.y) : null;

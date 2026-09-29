@@ -387,25 +387,25 @@ const App = (() => {
       const token = ++state.prefetchToken;
       const im = await ImageStore.load(row.img_id, row.name);
       if (token !== state.prefetchToken) return; // 已切走
-      const keepCrop = CanvasView.getViewMode() === "crop";
+      const keepFocus = CanvasView.getViewMode() === "focus";
       CanvasView.setImage(im);
       CanvasView.setBoxes(state.image.boxes);
-      // 新图就位后再退出特写（旧图 bitmap 已被 ImageStore 回收，不能提前渲染）
-      if (keepCrop) CanvasView.setViewMode("full");
+      // 新图就位后再退出定位（旧图 bitmap 已被 ImageStore 回收，不能提前渲染）
+      if (keepFocus) CanvasView.setViewMode("full");
       CanvasView.render();
       renderCrops();
       updateStatusUI();
       setBadge("saved");
       // 预取下一张
       if (state.queue[idx + 1]) ImageStore.prefetch(state.queue[idx + 1].img_id);
-      // 特写模式保持：新图从第一个轮播框开始（无可见框则回全图）
-      if (keepCrop) {
+      // 定位轮播保持：新图从第一个轮播框开始（无可见框则回全图）
+      if (keepFocus) {
         const ids = CropPanel.shownBoxIds;
         if (ids.length) enterCrop(ids[0]);
         else CanvasView.setViewMode("full");
       }
       // T1：全图模式下自动选中第一个未核验目标框
-      if (CanvasView.getViewMode() !== "crop" && state.task && state.task.kind === "t1") {
+      if (CanvasView.getViewMode() !== "focus" && state.task && state.task.kind === "t1") {
         const vb = new Set(state.image.verified_box_ids);
         const t = state.image.boxes.find(b =>
           state.task.class_ids.includes(b.class_id) && !vb.has(b.id));
@@ -724,14 +724,14 @@ const App = (() => {
 
   /* ============ 裁剪面板联动 ============ */
   function onPickBox(boxId) {
-    if (CanvasView.getViewMode() === "crop") enterCrop(boxId);
+    if (CanvasView.getViewMode() === "focus") enterCrop(boxId);
     else {
       CanvasView.setSelected(boxId);
       CanvasView.focusBox(boxId, true);
     }
   }
 
-  /* ============ 裁剪特写（W 切换 / Q·E 轮播） ============ */
+  /* ============ 定位轮播（W 切换 / Q·E 轮播）：视口定位放大到目标框（v1.0.0 式 focusBox），始终渲染整幅图 ============ */
   /* 轮播顺序与裁剪面板一致：T1 只含任务关注类别；T2 全部框且重点类（focus）排前 */
   function cropOrder() { return CropPanel.shownBoxIds; }
 
@@ -741,13 +741,15 @@ const App = (() => {
     CanvasView.setSelected(boxId);
     CropPanel.setSelected(boxId);
     CanvasView.setCropBox(boxId, i + 1, ids.length);
-    CanvasView.setViewMode("crop");
+    CanvasView.setViewMode("focus");
+    CanvasView.focusBox(boxId, true);   // 视口定位放大到该框（居中 + 框宽 2.2 倍适配，≤6 倍）
   }
 
   function toggleCropView() {
     if (!state.image) return;
-    if (CanvasView.getViewMode() === "crop") {
+    if (CanvasView.getViewMode() === "focus") {
       CanvasView.setViewMode("full");
+      CanvasView.fit();
       return;
     }
     const ids = cropOrder();
@@ -759,12 +761,12 @@ const App = (() => {
     if (!state.image) return;
     const ids = cropOrder();
     if (!ids.length) return;
-    const inCrop = CanvasView.getViewMode() === "crop";
-    let i = ids.indexOf(inCrop ? CanvasView.getCropBox() : CanvasView.getSelected());
+    const inFocus = CanvasView.getViewMode() === "focus";
+    let i = ids.indexOf(inFocus ? CanvasView.getCropBox() : CanvasView.getSelected());
     if (i < 0) i = dir > 0 ? -1 : 0;
     i = (i + dir + ids.length) % ids.length;   // 循环轮播
     const id = ids[i];
-    if (inCrop) {
+    if (inFocus) {
       enterCrop(id);
     } else {
       // 全图模式：Q/E 切换选中框并聚焦
@@ -839,8 +841,8 @@ const App = (() => {
     btn.classList.toggle("annotate", isAnnotate);
   }
   function toggleMode() {
-    // 特写模式下标注操作不可用：空格 = 退出特写并直接进入标注模式
-    if (CanvasView.getViewMode() === "crop") {
+    // 定位轮播中按空格 = 退出定位并直接进入标注模式
+    if (CanvasView.getViewMode() === "focus") {
       CanvasView.setViewMode("full");
       setMode(true);
       return;
@@ -876,7 +878,7 @@ const App = (() => {
   }
 
   function stepSelection(dir) {
-    if (CanvasView.getViewMode() === "crop") { stepCrop(dir); return; }
+    if (CanvasView.getViewMode() === "focus") { stepCrop(dir); return; }
     const ids = cropOrder();
     if (!ids.length) return;
     const cur = CanvasView.getSelected();
