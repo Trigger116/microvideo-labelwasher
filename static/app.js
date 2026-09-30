@@ -345,11 +345,8 @@ const App = (() => {
     const target = state.image.has_changes ? "已修改" : "已核验无修改";
     if (state.image.status === target) return;
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
-        status: target,
-        note: $("#img-note").value,
-        verified_box_ids: state.image.verified_box_ids,
-      });
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+                              stateBody(target, $("#img-note").value));
       state.image.status = r.status;
       state.image.note = r.note;
       state.image.has_changes = r.has_changes;
@@ -369,17 +366,24 @@ const App = (() => {
       return;
     }
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
-        status: "待裁决",
-        note: $("#img-note").value,
-        verified_box_ids: state.image.verified_box_ids,
-      });
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+                              stateBody("待裁决", $("#img-note").value));
       state.image.status = r.status;
       state.image.note = r.note;
       updateStatusUI();
       await refreshProgress();
       toast("图片已标为待裁决 ⚖️（再按 S 取消）", "ok");
     } catch (e) { toast(e.message, "error"); }
+  }
+
+  /* PUT /state 公共 body：per-task 状态机，所有状态/备注写入当前任务槽位 */
+  function stateBody(status, note) {
+    return {
+      status,
+      note,
+      verified_box_ids: state.image.verified_box_ids,
+      task_id: state.taskId || null,
+    };
   }
 
   async function openQueueImage(idx) {
@@ -390,7 +394,8 @@ const App = (() => {
     state.queueIdx = idx;
     updateNavUI();
     try {
-      const r = await Api.get(`/api/workspaces/${state.wsId}/images/${row.img_id}`);
+      const q = state.taskId ? `?task=${encodeURIComponent(state.taskId)}` : "";
+      const r = await Api.get(`/api/workspaces/${state.wsId}/images/${row.img_id}${q}`);
       state.image = {
         img: r.img, boxes: r.boxes, orig_boxes: r.orig_boxes,
         status: r.status, note: r.note,
@@ -502,7 +507,7 @@ const App = (() => {
     setBadge("saving");
     try {
       const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/boxes`,
-                              { boxes: state.image.boxes });
+                              { boxes: state.image.boxes, task_id: state.taskId || null });
       state.image.boxes = r.boxes;            // 服务端权威（含新框 id 分配）
       state.image.status = r.status;
       state.image.has_changes = r.has_changes;
@@ -516,7 +521,7 @@ const App = (() => {
           !($("#img-note").value || "").trim()) {
         const s = await Api.put(
           `/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
-          { status: "已核验无修改", note: "", verified_box_ids: state.image.verified_box_ids });
+          stateBody("已核验无修改", ""));
         state.image.status = s.status;
         updateStatusUI();
       }
@@ -535,11 +540,8 @@ const App = (() => {
     if (!state.noteDirty || !state.image) return;
     state.noteDirty = false;
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
-        status: state.image.status,
-        note: $("#img-note").value,
-        verified_box_ids: state.image.verified_box_ids,
-      });
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+                              stateBody(state.image.status, $("#img-note").value));
       state.image.note = r.note;
       setBadge(state.dirty ? "dirty" : "saved");
     } catch (e) {
@@ -552,11 +554,8 @@ const App = (() => {
     if (!state.image) return;
     await flush();
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
-        status,
-        note: $("#img-note").value,
-        verified_box_ids: state.image.verified_box_ids,
-      });
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+                              stateBody(status, $("#img-note").value));
       state.image.status = r.status;
       state.image.note = r.note;
       state.image.has_changes = r.has_changes;
@@ -577,8 +576,10 @@ const App = (() => {
     if (!confirm("恢复原始标注？当前该图所有框改动将丢弃")) return;
     await flush();
     try {
-      const r = await Api.post(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/reset`);
-      const img = await Api.get(`/api/workspaces/${state.wsId}/images/${state.image.img.id}`);
+      const r = await Api.post(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/reset`,
+                               { task_id: state.taskId || null });
+      const q = state.taskId ? `?task=${encodeURIComponent(state.taskId)}` : "";
+      const img = await Api.get(`/api/workspaces/${state.wsId}/images/${state.image.img.id}${q}`);
       state.image.boxes = img.boxes;
       state.image.status = img.status; state.image.note = img.note;
       state.image.verified_box_ids = img.verified_box_ids;
@@ -669,11 +670,8 @@ const App = (() => {
     if (ids.has(boxId)) ids.delete(boxId); else ids.add(boxId);
     state.image.verified_box_ids = [...ids];
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
-        status: state.image.status,
-        note: $("#img-note").value,
-        verified_box_ids: state.image.verified_box_ids,
-      });
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+                              stateBody(state.image.status, $("#img-note").value));
       state.image.note = r.note;
       renderCrops();
       await refreshProgress();
@@ -843,11 +841,8 @@ const App = (() => {
     ids.add(boxId);
     state.image.verified_box_ids = [...ids];
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`, {
-        status: state.image.status,
-        note: $("#img-note").value,
-        verified_box_ids: state.image.verified_box_ids,
-      });
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+                              stateBody(state.image.status, $("#img-note").value));
       state.image.note = r.note;
       renderCrops();
       await refreshProgress();

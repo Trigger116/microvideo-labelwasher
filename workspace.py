@@ -16,6 +16,8 @@ from io_utils import atomic_write_json, read_lines
 
 TERMINAL_STATUSES = ("已核验无修改", "已修改", "待裁决")
 ALL_STATUSES = ("未复核",) + TERMINAL_STATUSES
+# per-task 状态聚合优先级：任一任务"未复核" → 图未完成；否则 待裁决 > 已修改 > 已核验无修改
+AGG_STATUS_ORDER = ("待裁决", "已修改", "已核验无修改")
 MAX_BACKUPS = 20
 BACKUP_EVERY_SAVES = 50
 
@@ -107,7 +109,7 @@ def create_workspace(scan, ws_root, config_override=None, batch_dir=None, output
 
     ts = time.strftime("%Y%m%d_%H%M%S")
     ws = {
-        "version": 1,
+        "version": 1,           # ensure_task_states 迁移时升为 2（CSV 初始终态一并灌入 T1 槽位）
         "id": f"ws_{ts}",
         "created_at": ts, "updated_at": ts,
         "package": {
@@ -123,6 +125,9 @@ def create_workspace(scan, ws_root, config_override=None, batch_dir=None, output
         "config": cfg,
         "batch_dir": batch_dir,
         "images": images,
+        # per-task 状态槽位：{task_id: {img_id: {status, note}}}（v2；图级 status/note 保留为最新值兜底）
+        "task_states": {},
+        "task_states_migrated": False,
         "ui": {"last_task_id": None, "last_img_id": None},   # 中断恢复：上次处理位置（任务+图片）
         "_save_count": 0,
         "_clamp_dropped": clamp_dropped,
@@ -130,6 +135,8 @@ def create_workspace(scan, ws_root, config_override=None, batch_dir=None, output
     ws_dir = os.path.join(ws_root, ws["id"])
     os.makedirs(ws_dir, exist_ok=True)
     ws["_dir"] = ws_dir
+    from tasks import ensure_task_states   # 延迟 import 防循环；灌入 CSV 初始终态
+    ensure_task_states(ws)
     save_workspace(ws, ws_dir)
     return ws
 
@@ -145,6 +152,10 @@ def load_workspace(ws_root, ws_id):
     with open(p, "r", encoding="utf-8") as f:
         ws = json.load(f)
     ws["_dir"] = _ws_dir(ws_root, ws_id)
+    # v1→v2 迁移：旧全局终态状态复制到所属 T1 任务槽位（幂等；发生迁移时立即写盘）
+    from tasks import ensure_task_states   # 延迟 import 防循环（tasks 顶层只 import 本模块常量）
+    if ensure_task_states(ws):
+        save_workspace(ws, ws["_dir"])
     return ws
 
 
@@ -183,10 +194,11 @@ def _image_has_changes(im):
         len(im["boxes"]) != len(im["orig_boxes"])
 
 
-def put_boxes(ws, img_id, boxes_in, move_eps=None):
+def put_boxes(ws, img_id, boxes_in, move_eps=None, task_id=None):
     """全量替换该图当前框（幂等）。服务端分配 id、计算 diff、自动派生状态。
 
     boxes_in: [{"id":可选,"class_id","cx","cy","w","h"}]（坐标 0-1）
+    task_id: 带任务视角时派生状态写入该任务槽位（v2 per-task 状态机）
     返回 {"boxes":..., "has_changes":bool, "status":str, "warnings":[...]}
     """
     cfg = ws.get("config") or {}
@@ -230,27 +242,104 @@ def put_boxes(ws, img_id, boxes_in, move_eps=None):
             abs(ob["w"] - nb["w"]) > eps or abs(ob["h"] - nb["h"]) > eps))
     im["boxes"] = new_boxes
 
-    # 状态自动派生
+    # 状态自动派生（v2 带 task_id 时写该任务槽位；图级同步兜底）
+    cur_st = get_task_state(ws, task_id, img_id)["status"] if task_id else im["status"]
     if diff["has_changes"]:
-        if im["status"] == "未复核":
-            im["status"] = "已修改"
-        elif im["status"] == "已核验无修改":
-            im["status"] = "已修改"
+        new_st = cur_st
+        if cur_st == "未复核":
+            new_st = "已修改"
+        elif cur_st == "已核验无修改":
+            new_st = "已修改"
             warnings.append("该图已有框改动，状态已由'已核验无修改'自动纠正为'已修改'")
+        if task_id:
+            put_task_state(ws, task_id, img_id, new_st)
+            im["status"] = new_st
+        elif new_st != im["status"]:
+            im["status"] = new_st
     return {"boxes": new_boxes, "has_changes": diff["has_changes"],
-            "status": im["status"], "warnings": warnings}
+            "status": get_task_state(ws, task_id, img_id)["status"] if task_id else im["status"],
+            "warnings": warnings}
 
 
-def put_state(ws, img_id, status, note=None, verified_box_ids=None):
-    """设置图片状态/备注/框级核验记录。规则校验见计划。"""
+def get_task_state(ws, task_id, img_id):
+    """读取某任务下某图的状态（per-task 槽位；缺失 = 未复核）。"""
+    slot = (ws.get("task_states") or {}).get(task_id, {})
+    st = slot.get(img_id)
+    if st:
+        return {"status": st.get("status", "未复核"), "note": st.get("note", "")}
+    return {"status": "未复核", "note": ""}
+
+
+def put_task_state(ws, task_id, img_id, status, note=None):
+    """写入 per-task 槽位（不触碰图级兜底字段的备注；由 put_state 统一入口）。"""
+    slot = ws.setdefault("task_states", {}).setdefault(task_id, {})
+    cur = slot.get(img_id) or {}
+    slot[img_id] = {"status": status,
+                    "note": note if note is not None else cur.get("note", "")}
+    return slot[img_id]
+
+
+def _broadcast_state(ws, img_id, status, note):
+    """无 task_id 的旧式写入：同步到该图所属全部任务的槽位（兼容路径）。"""
+    from tasks import task_membership   # 延迟 import 防循环
+    for tid in task_membership(ws).get(img_id, []):
+        put_task_state(ws, tid, img_id, status, note)
+
+
+def _merge_statuses(statuses):
+    """跨任务槽位聚合：任一任务未复核 → 图未完成；否则 待裁决 > 已修改 > 已核验无修改。"""
+    if not statuses:
+        return None
+    if "未复核" in statuses:
+        return "未复核"
+    for s in AGG_STATUS_ORDER:
+        if s in statuses:
+            return s
+    return "已核验无修改"
+
+
+def aggregate_states(ws):
+    """一次性计算全部图的跨任务聚合状态 {img_id: {"status", "note"}}。
+    图不属于任何任务时回退图级最新值。"""
+    from tasks import task_membership   # 延迟 import 防循环
+    mem = task_membership(ws)
+    ts = ws.get("task_states") or {}
+    out = {}
+    for im in ws["images"]:
+        tids = mem.get(im["id"], [])
+        if not tids:
+            # 图不属于任何任务 → 图级最新值兜底
+            out[im["id"]] = {"status": im["status"], "note": im["note"] or ""}
+            continue
+        raw = [ts.get(tid, {}).get(im["id"]) for tid in tids]
+        # 槽位缺失 = 未复核（迁移后 T2 全新开始：旧图级终态不参与该任务）
+        status = _merge_statuses([s["status"] if s else "未复核" for s in raw])
+        notes = [s.get("note", "").strip() for s in raw if s and s.get("note", "").strip()]
+        out[im["id"]] = {"status": status, "note": "；".join(notes)}
+    return out
+
+
+def put_state(ws, img_id, status, note=None, verified_box_ids=None, task_id=None):
+    """设置图片状态/备注/框级核验记录。
+
+    v2：带 task_id → 写入该任务槽位（图级 status/note 同步为最新值兜底）；
+        不带 task_id → 旧语义：写图级并广播到该图所属全部任务槽位。
+    """
     im = get_image(ws, img_id)
     if status not in ALL_STATUSES:
         raise ValueError(f"非法状态: {status}")
-    if note is not None:
-        im["note"] = note
     if status == "已核验无修改" and _image_has_changes(im):
         raise ValueError("该图已存在框改动，不能标记为'已核验无修改'；请改为'已修改'或撤销改动")
-    im["status"] = status
+    if task_id:
+        put_task_state(ws, task_id, img_id, status, note)
+        if note is not None:
+            im["note"] = note
+        im["status"] = status
+    else:
+        if note is not None:
+            im["note"] = note
+        im["status"] = status
+        _broadcast_state(ws, img_id, status, im["note"] or "")
     if verified_box_ids is not None:
         valid = {b["id"] for b in im["boxes"]}
         im["verified_box_ids"] = [v for v in verified_box_ids if v in valid]
@@ -258,28 +347,37 @@ def put_state(ws, img_id, status, note=None, verified_box_ids=None):
             "has_changes": _image_has_changes(im)}
 
 
-def reset_image(ws, img_id):
+def reset_image(ws, img_id, task_id=None):
+    """恢复原始标注。带 task_id 时清除该任务槽位状态（回到未复核）。"""
     im = get_image(ws, img_id)
     im["boxes"] = copy.deepcopy(im["orig_boxes"])
     for b in im["boxes"]:
         b.update(verified=False, changed=False, is_new=False)
     im["verified_box_ids"] = []
+    if task_id:
+        slot = (ws.setdefault("task_states", {})).get(task_id)
+        if slot and img_id in slot:
+            del slot[img_id]
     if im["status"] == "已修改" and not im["note"]:
         im["status"] = "未复核"
-    return {"status": im["status"], "boxes": im["boxes"], "has_changes": False}
+    return {"status": get_task_state(ws, task_id, img_id)["status"] if task_id else im["status"],
+            "boxes": im["boxes"], "has_changes": False}
 
 
 def ws_stats(ws):
-    """进度/状态计数/类别分布（部分缓存可失效重算）。"""
+    """进度/状态计数/类别分布。v2 工作区用 per-task 聚合口径：
+    图"完成" = 其所属全部任务槽位都终态（聚合状态见 _merge_statuses）。"""
     n = len(ws["images"])
     status_counts = {}
     terminal = 0
     diff_images = 0
     cur_class_counts = {}
     orig_class_counts = {}
+    agg = aggregate_states(ws) if ws.get("task_states") is not None else None
     for im in ws["images"]:
-        status_counts[im["status"]] = status_counts.get(im["status"], 0) + 1
-        if im["status"] in TERMINAL_STATUSES:
+        st = agg[im["id"]]["status"] if agg else im["status"]
+        status_counts[st] = status_counts.get(st, 0) + 1
+        if st in TERMINAL_STATUSES:
             terminal += 1
         if _image_has_changes(im):
             diff_images += 1

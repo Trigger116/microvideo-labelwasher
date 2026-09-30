@@ -4,11 +4,15 @@
 T1（框级类别核验）：由 config.t1_tasks 定义，任务图集 = 含目标类当前框的图。
 T2（全图漏标扫视）：优先读取 batch_dir 下批次清单文件（与人工流程同源）；
   缺省时按 t2_rules（低框数/高密度/批大小）自算批次。
+
+v2 per-task 状态：图状态/备注按任务槽位存储（ws["task_states"]），
+  ensure_task_states 负责 v1 工作区的一次性迁移。
 """
 import glob
 import os
+import shutil
 
-from workspace import TERMINAL_STATUSES
+from workspace import TERMINAL_STATUSES, get_task_state
 
 
 def _class_names(ws):
@@ -26,6 +30,53 @@ def _task_image_ids(ws, task):
         if tids:
             pairs.append((im["id"], tids))
     return pairs, None
+
+
+def all_tasks_flat(ws):
+    """生成全部任务（T1+T2），不写任何索引进 ws。"""
+    return gen_t1_tasks(ws) + gen_t2_tasks(ws)
+
+
+def task_membership(ws):
+    """img_id → 所属任务 id 列表（T1 按框归属 + T2 按批次清单）。"""
+    mem = {}
+    for t in all_tasks_flat(ws):
+        pairs, _ = _task_image_ids(ws, t)
+        if t["kind"] == "t2":
+            for img_id in pairs:
+                mem.setdefault(img_id, []).append(t["id"])
+        else:
+            for img_id, _ in pairs:
+                mem.setdefault(img_id, []).append(t["id"])
+    return mem
+
+
+def ensure_task_states(ws):
+    """v1→v2 迁移（幂等）：旧全局终态状态复制到该图所属每个 T1 任务槽位；
+    T2 槽位只建空 dict（全新开始）。返回是否发生了实际迁移。"""
+    if ws.get("task_states_migrated"):
+        return False
+    ws.setdefault("task_states", {})
+    ts = ws["task_states"]
+    # 迁移前把原 workspace.json 备份一份（只读保护，防迁移异常破坏现有工作区）
+    if ws.get("version", 1) < 2 and ws.get("_dir"):
+        src = os.path.join(ws["_dir"], "workspace.json")
+        bak = os.path.join(ws["_dir"], "workspace.pre_v2.json")
+        if os.path.exists(src) and not os.path.exists(bak):
+            shutil.copy2(src, bak)
+    img_by_id = {im["id"]: im for im in ws["images"]}
+    for t in gen_t1_tasks(ws):
+        slot = ts.setdefault(t["id"], {})
+        pairs, _ = _task_image_ids(ws, t)
+        for img_id, _ in pairs:
+            im = img_by_id[img_id]
+            if im["status"] in TERMINAL_STATUSES and img_id not in slot:
+                slot[img_id] = {"status": im["status"], "note": im.get("note", "")}
+    for t in gen_t2_tasks(ws):
+        ts.setdefault(t["id"], {})
+    ws["version"] = 2
+    ws["task_states_migrated"] = True
+    return True
 
 
 def gen_t1_tasks(ws):
@@ -115,64 +166,49 @@ def _auto_t2_tasks(ws, rules):
     return tasks
 
 
-def task_progress(ws, task):
+def task_progress(ws, task, img_by_id=None):
     pairs, _ = _task_image_ids(ws, task)
+    img_by_id = img_by_id or {im["id"]: im for im in ws["images"]}
     if task["kind"] == "t2":
         ids = pairs
-        total = len(ids)
-        terminal = sum(1 for i in ids if ws["images_by_id"][i]["status"] in TERMINAL_STATUSES) \
-            if hasattr(ws, "images_by_id") else _count_terminal(ws, ids)
-        return {"total_images": total, "terminal_images": terminal,
+        terminal = sum(1 for i in ids
+                       if get_task_state(ws, task["id"], i)["status"] in TERMINAL_STATUSES)
+        return {"total_images": len(ids), "terminal_images": terminal,
                 "total_boxes": 0, "verified_boxes": 0}
-    ids = [p[0] for p in pairs]
     target_class_ids = set(task["class_ids"])
     total_boxes = verified_boxes = 0
+    terminal = 0
     for img_id, tids in pairs:
-        im = ws["images_by_id"][img_id] if hasattr(ws, "images_by_id") else _find_image(ws, img_id)
+        im = img_by_id[img_id]
         vb = set(im.get("verified_box_ids") or [])
         for b in im["boxes"]:
             if b["class_id"] in target_class_ids:
                 total_boxes += 1
                 if b["id"] in vb:
                     verified_boxes += 1
-    terminal = _count_terminal(ws, ids)
-    return {"total_images": len(ids), "terminal_images": terminal,
+        if get_task_state(ws, task["id"], img_id)["status"] in TERMINAL_STATUSES:
+            terminal += 1
+    return {"total_images": len(pairs), "terminal_images": terminal,
             "total_boxes": total_boxes, "verified_boxes": verified_boxes}
 
 
-def _find_image(ws, img_id):
-    for im in ws["images"]:
-        if im["id"] == img_id:
-            return im
-    return None
-
-
-def _count_terminal(ws, ids):
-    n = 0
-    for i in ids:
-        im = _find_image(ws, i)
-        if im and im["status"] in TERMINAL_STATUSES:
-            n += 1
-    return n
-
-
 def all_tasks(ws):
-    """返回 {t1:[...], t2:[...]}，每个任务带进度统计。"""
-    ws["images_by_id"] = {im["id"]: im for im in ws["images"]}
+    """返回 {t1:[...], t2:[...]}，每个任务带进度统计。不写任何索引进 ws。"""
+    img_by_id = {im["id"]: im for im in ws["images"]}
     out = {"t1": [], "t2": []}
     for t in gen_t1_tasks(ws):
-        t["progress"] = task_progress(ws, t)
+        t["progress"] = task_progress(ws, t, img_by_id)
         out["t1"].append(t)
     for t in gen_t2_tasks(ws):
-        t["progress"] = task_progress(ws, t)
+        t["progress"] = task_progress(ws, t, img_by_id)
         out["t2"].append(t)
     return out
 
 
 def task_images(ws, task_id, offset=0, limit=50):
-    """任务图队列：未终态图排前。返回 {total, images:[...]}。"""
-    ws["images_by_id"] = {im["id"]: im for im in ws["images"]}
-    tasks = gen_t1_tasks(ws) + gen_t2_tasks(ws)
+    """任务图队列：未终态图排前（per-task 槽位视角）。返回 {total, images:[...]}。"""
+    img_by_id = {im["id"]: im for im in ws["images"]}
+    tasks = all_tasks_flat(ws)
     task = next((t for t in tasks if t["id"] == task_id), None)
     if task is None:
         raise KeyError(f"任务不存在: {task_id}")
@@ -181,18 +217,19 @@ def task_images(ws, task_id, offset=0, limit=50):
         rows = [(pid, []) for pid in pairs]
     else:
         rows = pairs
-    rows.sort(key=lambda r: 0 if ws["images_by_id"][r[0]]["status"] in TERMINAL_STATUSES else 1)
+    rows.sort(key=lambda r: 0 if get_task_state(ws, task_id, r[0])["status"] in TERMINAL_STATUSES else 1)
     total = len(rows)
     page = rows[offset:offset + limit]
     out = []
     for img_id, tids in page:
-        im = ws["images_by_id"][img_id]
+        im = img_by_id[img_id]
+        st = get_task_state(ws, task_id, img_id)
         out.append({
             "img_id": img_id, "name": im["name"], "split": im["split"],
             "box_count": len(im["boxes"]),
             "target_box_ids": tids,
             "target_count": len(tids),
-            "status": im["status"], "note": im["note"],
+            "status": st["status"], "note": st["note"],
             "has_changes": _img_changed(im),
         })
     return {"total": total, "images": out}

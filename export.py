@@ -9,7 +9,7 @@ import time
 
 from io_utils import (atomic_write_text, copy_file_bytes, fmt_float,
                       is_within, read_lines)
-from workspace import TERMINAL_STATUSES, ws_stats
+from workspace import TERMINAL_STATUSES, aggregate_states, ws_stats
 
 
 def _image_by_ref(ws, split, filename):
@@ -34,8 +34,8 @@ def _note_summary(im, diff):
     return "/".join(parts)
 
 
-def _export_csv(ws, pkg_dir, out_subdir, csv_bom, report):
-    """生成复核记录.csv（BOM + CRLF，行序同输入原序）。"""
+def _export_csv(ws, pkg_dir, out_subdir, csv_bom, report, agg):
+    """生成复核记录.csv（BOM + CRLF，行序同输入原序）。状态/备注取跨任务聚合。"""
     from diffs import diff_boxes
 
     header = ["文件名", "split", "原始框数", "状态", "修改说明或疑问"]
@@ -49,23 +49,25 @@ def _export_csv(ws, pkg_dir, out_subdir, csv_bom, report):
                                    row["status"], row["note"]]))
             continue
         seen.add(im["id"])
-        note = im["note"] or ""
+        st = agg[im["id"]] if agg else {"status": im["status"], "note": im["note"]}
+        note = st["note"] or ""
         diff = diff_boxes(im["orig_boxes"], im["boxes"])
-        if im["status"] == "已修改" and not note:
+        if st["status"] == "已修改" and not note:
             note = _note_summary(im, diff)
-        elif im["status"] == "待裁决" and not note:
+        elif st["status"] == "待裁决" and not note:
             pending_warnings.append(f"{im['name']}: 待裁决但无原因备注")
         lines.append(",".join([im["name"], im["split"], str(im["orig_box_count"]),
-                               im["status"], note.replace(",", "，").replace("\r", "").replace("\n", "；")]))
+                               st["status"], note.replace(",", "，").replace("\r", "").replace("\n", "；")]))
     for im in ws["images"]:
         if im["id"] in seen:
             continue
+        st = agg[im["id"]] if agg else {"status": im["status"], "note": im["note"]}
         diff = diff_boxes(im["orig_boxes"], im["boxes"])
-        note = im["note"] or ("/" if False else "")
-        if im["status"] == "已修改" and not note:
+        note = st["note"] or ("/" if False else "")
+        if st["status"] == "已修改" and not note:
             note = _note_summary(im, diff)
         lines.append(",".join([im["name"], im["split"], str(im["orig_box_count"]),
-                               im["status"], note.replace(",", "，")]))
+                               st["status"], note.replace(",", "，")]))
     csv_text = "\r\n".join(lines) + "\r\n"
     out_path = os.path.join(out_subdir, "复核记录.csv")
     atomic_write_bytes_bom(out_path, csv_text)
@@ -116,6 +118,7 @@ def export_workspace(ws, output_dir=None, overwrite=False, strict=None):
         if strict:
             raise ValueError(msg + "（strict 模式拒绝导出）")
         warnings.append(msg + "（已在报告中列出）")
+    agg = aggregate_states(ws) if ws.get("task_states") is not None else None
 
     if os.path.exists(out_root) and not overwrite:
         raise FileExistsError(f"输出目录已存在（需确认覆盖）: {out_root}")
@@ -157,7 +160,7 @@ def export_workspace(ws, output_dir=None, overwrite=False, strict=None):
     _export_labels(ws, out_subdir, decimals)
 
     # 4) 复核记录.csv
-    csv_warnings = _export_csv(ws, pkg_dir, out_subdir, csv_bom, None)
+    csv_warnings = _export_csv(ws, pkg_dir, out_subdir, csv_bom, None, agg)
     warnings.extend(csv_warnings)
 
     # 5) 审计报告
@@ -172,10 +175,11 @@ def export_workspace(ws, output_dir=None, overwrite=False, strict=None):
 
 
 def build_report(ws):
-    """修改审计报告：转换对/增删框/待裁决清单（F-1 要求）。"""
+    """修改审计报告：转换对/增删框/待裁决清单（F-1 要求）。状态取跨任务聚合。"""
     from diffs import diff_boxes
 
     names = {c["id"]: f"{c['zh']}({c['name']})" for c in ws["package"]["classes"]}
+    agg = aggregate_states(ws) if ws.get("task_states") is not None else None
     conversions = {}
     counts = {"class_changed": 0, "moved": 0, "added": 0, "removed": 0}
     diff_images = 0
@@ -183,6 +187,7 @@ def build_report(ws):
     pending_list = []
     unreviewed = []
     for im in ws["images"]:
+        st = (agg[im["id"]] if agg else {"status": im["status"], "note": im["note"]})
         d = diff_boxes(im["orig_boxes"], im["boxes"])
         if d["has_changes"]:
             diff_images += 1
@@ -191,14 +196,14 @@ def build_report(ws):
             for c in counts:
                 counts[c] += d["counts"][c]
             changed_detail.append({
-                "name": im["name"], "split": im["split"], "status": im["status"],
+                "name": im["name"], "split": im["split"], "status": st["status"],
                 "counts": d["counts"],
                 "conversions": [{"from": names.get(a, str(a)), "to": names.get(b, str(b)), "n": n}
                                 for (a, b), n in sorted(d["conversions"].items())],
             })
-        if im["status"] == "待裁决":
-            pending_list.append({"name": im["name"], "split": im["split"], "note": im["note"]})
-        if im["status"] == "未复核":
+        if st["status"] == "待裁决":
+            pending_list.append({"name": im["name"], "split": im["split"], "note": st["note"]})
+        if st["status"] == "未复核":
             unreviewed.append(f"{im['split']}/{im['name']}")
     st = ws_stats(ws)
     return {

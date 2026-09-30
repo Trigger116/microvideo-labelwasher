@@ -200,6 +200,197 @@ class TestTasks(unittest.TestCase):
         self.assertEqual(t["t1"][0]["progress"]["total_boxes"], 108)  # 交警
 
 
+class TestTaskStates(unittest.TestCase):
+    """v2 per-task 状态机：迁移 / 槽位隔离 / 广播兼容 / 聚合口径。"""
+
+    def _mk_ws(self, tmp, batch_dir=None):
+        d = tempfile.mkdtemp()
+        pkg = make_fixture(d)
+        scan = packages.scan_package(os.path.dirname(pkg), os.path.basename(pkg))
+        return workspace.create_workspace(scan, tmp, batch_dir=batch_dir,
+                                          output_dir=os.path.join(tmp, "out_done"))
+
+    def _img(self, ws, name):
+        return next(i for i in ws["images"] if i["name"] == name)
+
+    def _degrade_to_v1(self, ws):
+        """把新建 ws 手动退化为 v1 形态并落盘（删槽位、version=1），模拟旧工作区。"""
+        ws["version"] = 1
+        ws.pop("task_states", None)
+        ws["task_states_migrated"] = False
+        workspace.save_workspace(ws)
+
+    def test_migration_copies_terminal_to_t1_slots(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        a2 = self._img(ws, "a2.png")
+        a1["status"] = "已修改"
+        a1["note"] = "旧全局备注"
+        a2["status"] = "待裁决"
+        self._degrade_to_v1(ws)
+        self.assertTrue(tasks.ensure_task_states(ws))
+        self.assertEqual(ws["version"], 2)
+        self.assertTrue(ws["task_states_migrated"])
+        ts = ws["task_states"]
+        # a1 含 builder(0)+sedan(2) 框 → 归属 t1-9 / t1-10，终态复制到两槽位
+        self.assertEqual(ts["t1-9"][a1["id"]]["status"], "已修改")
+        self.assertEqual(ts["t1-9"][a1["id"]]["note"], "旧全局备注")
+        self.assertEqual(ts["t1-10"][a1["id"]]["status"], "已修改")
+        # a2 仅 truck(3) 框 → 无 T1 归属；T2 槽位只建空 dict（全新开始）
+        self.assertEqual(ts.get("t2-auto-low", {}), {})
+        # 图级字段保留（兜底值不动）
+        self.assertEqual(a1["status"], "已修改")
+        # 迁移前自动备份
+        self.assertTrue(os.path.exists(os.path.join(tmp, ws["id"], "workspace.pre_v2.json")))
+
+    def test_migration_idempotent(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        self._img(ws, "a1.jpg")["status"] = "已修改"
+        self._degrade_to_v1(ws)
+        self.assertTrue(tasks.ensure_task_states(ws))
+        snap = copy.deepcopy(ws["task_states"])
+        self.assertFalse(tasks.ensure_task_states(ws))
+        self.assertEqual(ws["task_states"], snap)
+        # load_workspace 重载也不重复迁移
+        ws2 = workspace.load_workspace(tmp, ws["id"])
+        self.assertEqual(ws2["task_states"], snap)
+
+    def test_slot_isolation_and_aggregate(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        t2_id = tasks.gen_t2_tasks(ws)[0]["id"]
+        workspace.put_state(ws, a1["id"], "待裁决", note="反光服存疑", task_id="t1-9")
+        self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["status"], "待裁决")
+        self.assertEqual(workspace.get_task_state(ws, "t1-10", a1["id"])["status"], "未复核")
+        # 其他任务槽位未完成 → 聚合仍"未复核"
+        agg = workspace.aggregate_states(ws)
+        self.assertEqual(agg[a1["id"]]["status"], "未复核")
+        # t1-10 写"已核验无修改"（图无框改动，允许）；t2 完成 → 聚合 待裁决 优先
+        workspace.put_state(ws, a1["id"], "已核验无修改", task_id="t1-10")
+        workspace.put_state(ws, a1["id"], "已核验无修改", task_id=t2_id)
+        agg = workspace.aggregate_states(ws)
+        self.assertEqual(agg[a1["id"]]["status"], "待裁决")
+        self.assertEqual(agg[a1["id"]]["note"], "反光服存疑")
+        # 槽位互不覆盖
+        self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["status"], "待裁决")
+        self.assertEqual(workspace.get_task_state(ws, "t1-10", a1["id"])["status"], "已核验无修改")
+
+    def test_broadcast_without_task_id(self):
+        """旧 API（无 task_id）写图级并广播到全部所属任务槽位。"""
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        t2_id = tasks.gen_t2_tasks(ws)[0]["id"]
+        workspace.put_state(ws, a1["id"], "已修改", note="旧 API 兼容")
+        for tid in ("t1-9", "t1-10", t2_id):
+            self.assertEqual(workspace.get_task_state(ws, tid, a1["id"])["status"], "已修改")
+        self.assertEqual(workspace.aggregate_states(ws)[a1["id"]]["status"], "已修改")
+
+    def test_task_images_slot_view(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        workspace.put_state(ws, a1["id"], "已核验无修改", task_id="t1-9")
+        r9 = tasks.task_images(ws, "t1-9")
+        self.assertEqual(r9["total"], 1)
+        self.assertEqual(r9["images"][0]["status"], "已核验无修改")
+        # 同图在 t1-10 视角仍未复核
+        r10 = tasks.task_images(ws, "t1-10")
+        self.assertEqual(r10["total"], 1)
+        self.assertEqual(r10["images"][0]["status"], "未复核")
+        # 任务进度同样槽位视角
+        flat = {t["id"]: t for t in tasks.all_tasks_flat(ws)}
+        self.assertEqual(tasks.task_progress(ws, flat["t1-9"])["terminal_images"], 1)
+        self.assertEqual(tasks.task_progress(ws, flat["t1-10"])["terminal_images"], 0)
+
+    def test_put_boxes_writes_task_slot(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        boxes = copy.deepcopy(a1["boxes"])
+        boxes[0]["class_id"] = 1
+        r = workspace.put_boxes(ws, a1["id"], boxes, task_id="t1-9")
+        self.assertEqual(r["status"], "已修改")
+        self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["status"], "已修改")
+        self.assertEqual(workspace.get_task_state(ws, "t1-10", a1["id"])["status"], "未复核")
+
+    def test_reset_clears_task_slot(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        workspace.put_state(ws, a1["id"], "已修改", task_id="t1-9")
+        self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["status"], "已修改")
+        r = workspace.reset_image(ws, a1["id"], task_id="t1-9")
+        self.assertEqual(r["status"], "未复核")
+        self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["status"], "未复核")
+
+    def test_ws_stats_aggregate(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        t2_id = tasks.gen_t2_tasks(ws)[0]["id"]
+        workspace.put_state(ws, a1["id"], "已修改", task_id="t1-9")
+        workspace.put_state(ws, a1["id"], "已核验无修改", task_id="t1-10")
+        workspace.put_state(ws, a1["id"], "已核验无修改", task_id=t2_id)
+        st = workspace.ws_stats(ws)
+        self.assertEqual(st["terminal_images"], 1)  # 仅 a1 全任务完成
+        self.assertEqual(st["status_counts"].get("已修改"), 1)
+        self.assertEqual(st["status_counts"].get("未复核"), 3)
+
+    def test_create_ws_imports_csv_terminal(self):
+        """create_workspace 把 CSV 初始终态灌入 T1 槽位；T2 槽位空白。"""
+        d = tempfile.mkdtemp()
+        pkg = make_fixture(d)
+        csv_p = os.path.join(pkg, "复核记录.csv")
+        with open(csv_p, "w", encoding="utf-8", newline="") as f:
+            f.write("文件名,split,原始框数,状态,修改说明或疑问\r\n")
+            f.write("a1.jpg,train,2,已核验无修改,导入备注\r\n")
+            f.write("a2.png,train,1,未复核,\r\n")
+            f.write("a3.jpg,train,0,未复核,\r\n")
+            f.write("b1.jpg,val,1,未复核,\r\n")
+        scan = packages.scan_package(os.path.dirname(pkg), os.path.basename(pkg))
+        tmp = tempfile.mkdtemp()
+        ws = workspace.create_workspace(scan, tmp)
+        a1 = self._img(ws, "a1.jpg")
+        self.assertEqual(ws["version"], 2)
+        self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["status"], "已核验无修改")
+        self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["note"], "导入备注")
+        self.assertEqual(workspace.get_task_state(ws, "t1-10", a1["id"])["status"], "已核验无修改")
+        t2_id = tasks.gen_t2_tasks(ws)[0]["id"]
+        self.assertEqual(workspace.get_task_state(ws, t2_id, a1["id"])["status"], "未复核")
+
+    def test_export_uses_aggregate(self):
+        """导出 CSV/报告用聚合口径：图级已修改但槽位未复核 → 仍算未复核。"""
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        a1 = self._img(ws, "a1.jpg")
+        a3 = self._img(ws, "a3.jpg")
+        t2_id = tasks.gen_t2_tasks(ws)[0]["id"]
+        boxes = copy.deepcopy(a1["boxes"])
+        boxes[0]["class_id"] = 1
+        workspace.put_boxes(ws, a1["id"], boxes, task_id="t1-9")
+        workspace.put_state(ws, a1["id"], "已修改", task_id="t1-9")
+        workspace.put_state(ws, a1["id"], "已修改", task_id="t1-10")
+        workspace.put_state(ws, a1["id"], "已修改", task_id=t2_id)
+        boxes3 = copy.deepcopy(a3["boxes"])
+        boxes3.append({"class_id": 2, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2})
+        workspace.put_boxes(ws, a3["id"], boxes3)  # 无 task_id：只图级派生，槽位仍空白
+        res = export_mod.export_workspace(ws, overwrite=True)
+        self.assertEqual(len(res["warnings"]), 1)
+        self.assertEqual(res["report"]["status_counts"].get("已修改"), 1)
+        self.assertEqual(res["report"]["status_counts"].get("未复核"), 3)
+        out_sub = os.path.join(ws["package"]["output_dir"], ws["package"]["subdir"])
+        csv_txt = io_utils.read_text(os.path.join(out_sub, "复核记录.csv"))
+        a1_line = next(l for l in csv_txt.splitlines() if l.startswith("a1.jpg"))
+        a3_line = next(l for l in csv_txt.splitlines() if l.startswith("a3.jpg"))
+        self.assertIn("已修改", a1_line)
+        self.assertIn("未复核", a3_line)  # 槽位视角，而非图级"已修改"
+        shutil.rmtree(ws["package"]["output_dir"], ignore_errors=True)
+
+
 class TestExport(unittest.TestCase):
     def test_fixture_export(self):
         d = tempfile.mkdtemp()

@@ -254,17 +254,19 @@ def create_app(ws_root=None, port_file=None):
         split = request.args.get("split") or ""
         status = request.args.get("status") or ""
         q = (request.args.get("q") or "").lower()
+        agg = workspace_mod.aggregate_states(ws) if ws.get("task_states") is not None else None
         rows = []
         for im in ws["images"]:
+            st = (agg[im["id"]] if agg else im)
             if split and im["split"] != split:
                 continue
-            if status and im["status"] != status:
+            if status and st["status"] != status:
                 continue
             if q and q not in im["name"].lower():
                 continue
             rows.append({"img_id": im["id"], "name": im["name"], "split": im["split"],
-                         "box_count": len(im["boxes"]), "status": im["status"],
-                         "note": im["note"], "has_changes": _img_changed(im)})
+                         "box_count": len(im["boxes"]), "status": st["status"],
+                         "note": st["note"], "has_changes": _img_changed(im)})
         rows.sort(key=lambda r: 0 if r["status"] in workspace_mod.TERMINAL_STATUSES else 1)
         total = len(rows)
         offset = int(request.args.get("offset", 0))
@@ -278,12 +280,20 @@ def create_app(ws_root=None, port_file=None):
             im = workspace_mod.get_image(ws, img_id)
         except KeyError:
             return api_error("E_IMG_NOT_FOUND", f"图片不存在: {img_id}", 404)
+        task_id = request.args.get("task") or None
+        agg = workspace_mod.aggregate_states(ws).get(img_id) or \
+            {"status": im["status"], "note": im["note"]}
+        if task_id:
+            st = workspace_mod.get_task_state(ws, task_id, img_id)
+        else:
+            st = {"status": agg["status"], "note": agg["note"]}
         return jsonify({
             "img": {"id": im["id"], "name": im["name"], "split": im["split"],
                     "width": im["width"], "height": im["height"],
                     "rel_image": im["rel_image"]},
             "boxes": im["boxes"], "orig_boxes": im["orig_boxes"],
-            "status": im["status"], "note": im["note"],
+            "status": st["status"], "note": st["note"],
+            "aggregate_status": agg["status"],
             "verified_box_ids": im["verified_box_ids"],
             "has_changes": _img_changed(im),
         })
@@ -305,7 +315,8 @@ def create_app(ws_root=None, port_file=None):
         ws = store.get(ws_id)
         d = request.get_json(silent=True) or {}
         try:
-            res = workspace_mod.put_boxes(ws, img_id, d.get("boxes") or [])
+            res = workspace_mod.put_boxes(ws, img_id, d.get("boxes") or [],
+                                          task_id=d.get("task_id"))
             store.save(ws)
             return jsonify({"boxes": res["boxes"], "has_changes": res["has_changes"],
                             "status": res["status"], "warnings": res["warnings"]})
@@ -321,7 +332,8 @@ def create_app(ws_root=None, port_file=None):
         try:
             res = workspace_mod.put_state(ws, img_id, d.get("status", ""),
                                           note=d.get("note"),
-                                          verified_box_ids=d.get("verified_box_ids"))
+                                          verified_box_ids=d.get("verified_box_ids"),
+                                          task_id=d.get("task_id"))
             store.save(ws)
             return jsonify(res)
         except KeyError:
@@ -332,8 +344,9 @@ def create_app(ws_root=None, port_file=None):
     @app.post("/api/workspaces/<ws_id>/images/<img_id>/reset")
     def reset_image(ws_id, img_id):
         ws = store.get(ws_id)
+        d = request.get_json(silent=True) or {}
         try:
-            res = workspace_mod.reset_image(ws, img_id)
+            res = workspace_mod.reset_image(ws, img_id, task_id=d.get("task_id"))
             store.save(ws)
             return jsonify(res)
         except KeyError:
@@ -343,15 +356,17 @@ def create_app(ws_root=None, port_file=None):
     @app.get("/api/workspaces/<ws_id>/csv")
     def get_csv(ws_id):
         ws = store.get(ws_id)
+        agg = workspace_mod.aggregate_states(ws) if ws.get("task_states") is not None else None
         lines = ["文件名,split,原始框数,状态,修改说明或疑问"]
         from diffs import diff_boxes
         for im in ws["images"]:
-            note = im["note"] or ""
-            if im["status"] == "已修改" and not note:
+            st = (agg[im["id"]] if agg else im)
+            note = st["note"] or ""
+            if st["status"] == "已修改" and not note:
                 d = diff_boxes(im["orig_boxes"], im["boxes"])
                 note = _note_summary(im, d)
             lines.append(",".join([im["name"], im["split"], str(im["orig_box_count"]),
-                                   im["status"], note.replace(",", "，")]))
+                                   st["status"], note.replace(",", "，")]))
         from flask import Response
         return Response("﻿" + "\r\n".join(lines) + "\r\n", mimetype="text/csv; charset=utf-8")
 
