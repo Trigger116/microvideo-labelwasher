@@ -12,3 +12,6 @@ logs/
 # 构建产物
 build/
 dist/
+
+# E2E 测试缓存（测试副本 / 迁移回归副本）
+workspaces_e2e/
