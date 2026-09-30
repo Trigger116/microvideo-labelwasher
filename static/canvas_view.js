@@ -547,6 +547,8 @@ const CanvasView = (() => {
     b.h = (y2 - y1) / img.height;
   }
 
+  function isDragging() { return !!drag; }
+
   function updateCursor(p) {
     if (!img) { canvas.style.cursor = "default"; return; }
     if (mode === "annotate") {
@@ -567,7 +569,7 @@ const CanvasView = (() => {
   return {
     init, resize, setMode, setImage, setBoxes, setClasses, setSelected,
     getSelected, getMode, fit, zoomAt, zoomIn, zoomOut, focusBox, render,
-    setViewMode, setCropBox, getViewMode, getCropBox,
+    setViewMode, setCropBox, getViewMode, getCropBox, isDragging,
     get boxes() { return boxes; },
   };
 })();

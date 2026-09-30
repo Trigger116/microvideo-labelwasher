@@ -595,8 +595,10 @@ const App = (() => {
         const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/boxes`,
                                 { boxes: sentBoxes, task_id: state.taskId || null });
         if (!stillOn(imgId)) return;   // 已翻图 → 丢弃响应（服务端已正确落库旧图）
-        if (state.dirty || state.image.boxes !== sentBoxes) {
-          // 飞行中又编辑：不覆盖本地数组；仅按发送序回填服务端新框 id，重排保存
+        if (state.dirty || state.image.boxes !== sentBoxes || CanvasView.isDragging()) {
+          // 飞行中又编辑 / 正在拖动：不覆盖本地数组（拖动中 drag.box 引用当前数组对象，
+          // 替换数组会让后续 onMove 修改失效对象，表现为"锚点偶尔拖不动"）；
+          // 仅按发送序回填服务端新框 id，拖动结束 onUp 会重排保存
           const serverNew = r.boxes.filter(b => b.is_new);
           sentNew.forEach((nb, i) => {
             if (!nb.id && serverNew[i]) nb.id = serverNew[i].id;
