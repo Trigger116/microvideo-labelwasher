@@ -7,10 +7,13 @@
   LABELWASH_BATCH_DIR      T2 批次清单目录（可选，配合前两者使用）
 """
 import copy
+import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -436,6 +439,114 @@ class TestExport(unittest.TestCase):
         self.assertEqual(res["report"]["counts"]["class_changed"], 1)
         self.assertEqual(res["report"]["counts"]["added"], 1)
         shutil.rmtree(out, ignore_errors=True)
+
+
+class TestAsyncSave(unittest.TestCase):
+    """P2 异步合并写盘：序列化瘦身 / 去抖合并 / flush / 并发 mutation / stats 缓存。"""
+
+    def _mk_ws(self, tmp):
+        d = tempfile.mkdtemp()
+        pkg = make_fixture(d)
+        scan = packages.scan_package(os.path.dirname(pkg), os.path.basename(pkg))
+        return workspace.create_workspace(scan, tmp, output_dir=os.path.join(tmp, "out_done"))
+
+    def test_dumps_strips_helper_keys(self):
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        workspace.get_image(ws, ws["images"][0]["id"])  # 构建 _img_index
+        ws["_mut_seq"] = 7
+        data = json.loads(workspace._dumps_workspace(ws).decode("utf-8"))
+        self.assertNotIn("_dir", data)
+        self.assertNotIn("_mut_seq", data)
+        self.assertNotIn("_img_index", data)
+        self.assertNotIn("images_by_id", data)
+        self.assertEqual(data["version"], 2)
+
+    def test_scheduler_debounce_merge_and_flush(self):
+        import server
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        sched = server.SaveScheduler(ws, ws["_dir"], debounce=0.2)
+        calls = []
+        orig = workspace.atomic_write_bytes
+        workspace.atomic_write_bytes = lambda path, data: calls.append(data)
+        try:
+            sched.schedule()
+            sched.schedule()
+            sched.schedule()                 # 突发 3 次 → 合并 1 次写
+            time.sleep(0.05)
+            self.assertEqual(len(calls), 0)  # 去抖窗口内未写
+            sched.flush()
+            self.assertEqual(len(calls), 1)  # flush 立即写
+            sched.flush()
+            self.assertEqual(len(calls), 1)  # 无未决内容 → 不重复写
+            sched.schedule()
+            time.sleep(0.3)                  # 超过去抖(0.2s) → 后台自动写
+            self.assertEqual(len(calls), 2)
+            sched.stop()
+        finally:
+            workspace.atomic_write_bytes = orig
+
+    def test_concurrent_mutations(self):
+        import server
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        sched = server.SaveScheduler(ws, ws["_dir"], debounce=0.05)
+        ids = [im["id"] for im in ws["images"]]
+        errors = []
+
+        def worker(k):
+            try:
+                for _ in range(20):
+                    workspace.put_state(ws, ids[k % len(ids)], "待裁决",
+                                        note=f"t{k}", task_id="t1-9")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(k,)) for k in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        sched.schedule()
+        sched.flush()
+        disk = json.load(open(os.path.join(tmp, ws["id"], "workspace.json"),
+                              encoding="utf-8"))
+        slot = disk["task_states"]["t1-9"]
+        for img_id in ids:
+            self.assertEqual(slot[img_id]["status"], "待裁决")
+        sched.stop()
+
+    def test_stats_cache_invalidation(self):
+        import server
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        store = server.WsStore(tmp)
+        store._cache[ws["id"]] = ws
+        d1 = store.stats_and_tasks(ws)
+        d2 = store.stats_and_tasks(ws)
+        self.assertIs(d1["stats"], d2["stats"])   # 命中缓存
+        a1 = next(i for i in ws["images"] if i["name"] == "a1.jpg")
+        workspace.put_state(ws, a1["id"], "待裁决", task_id="t1-9")
+        d3 = store.stats_and_tasks(ws)
+        self.assertIsNot(d1["stats"], d3["stats"])  # mutation 后失效重算
+        self.assertGreater(ws["_mut_seq"], 0)
+
+    def test_schedule_flush_persists_edits(self):
+        import server
+        tmp = tempfile.mkdtemp()
+        ws = self._mk_ws(tmp)
+        store = server.WsStore(tmp)
+        store._cache[ws["id"]] = ws
+        a1 = next(i for i in ws["images"] if i["name"] == "a1.jpg")
+        workspace.put_state(ws, a1["id"], "已修改", note="P2", task_id="t1-9")
+        store.schedule(ws)
+        store.flush(ws["id"])
+        disk = json.load(open(os.path.join(tmp, ws["id"], "workspace.json"),
+                              encoding="utf-8"))
+        self.assertEqual(disk["task_states"]["t1-9"][a1["id"]]["status"], "已修改")
+        store.stop_and_flush(ws["id"])
 
 
 class TestApi(unittest.TestCase):

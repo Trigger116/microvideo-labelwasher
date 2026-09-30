@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Flask app 工厂 + 全部 REST API（薄层：解析参数、调 service、统一错误）。"""
+import atexit
 import os
 import subprocess
 import threading
@@ -21,26 +22,162 @@ def api_error(code, message, status=400):
     return jsonify({"error": {"code": code, "message": message}}), status
 
 
+class SaveScheduler:
+    """每工作区一个后台写盘线程：mutation 去抖 ~400ms 合并写盘。
+
+    写路径 = 锁内 dumps 快照（与 mutation 同锁互斥）+ 锁外原子写盘/备份；
+    flush() 立即同步写最新状态（仅当有未写盘内容），供导出/删除/关闭等关键点调用。
+    """
+
+    def __init__(self, ws, ws_dir, debounce=0.4):
+        self.ws = ws
+        self.ws_dir = ws_dir
+        self.debounce = debounce
+        self._cv = threading.Condition()
+        self._dirty = False     # 有未写盘内容
+        self._pending = False   # 去抖窗口内来了新 mutation（延后 deadline 用）
+        self._writing = False
+        self._stopped = False
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"save-{ws.get('id')}")
+        self._thread.start()
+
+    def schedule(self):
+        with self._cv:
+            self._dirty = True
+            self._pending = True
+            self._cv.notify()
+
+    def flush(self, timeout=10):
+        """立即同步写盘（绕过去抖）。无未写内容时直接返回（翻图高频调用零开销）。"""
+        t0 = time.time()
+        with self._cv:
+            while self._writing and time.time() - t0 < timeout:
+                self._cv.wait(0.1)
+            dirty = self._dirty
+        if not dirty:
+            return
+        with workspace_mod._ws_lock(self.ws_dir):
+            payload = workspace_mod._dumps_workspace(self.ws)
+        workspace_mod.atomic_write_bytes(os.path.join(self.ws_dir, "workspace.json"), payload)
+        if self.ws["_save_count"] % workspace_mod.BACKUP_EVERY_SAVES == 0:
+            workspace_mod._do_backup(self.ws_dir, self.ws["updated_at"])
+        with self._cv:
+            self._dirty = False
+            self._pending = False
+
+    def stop(self):
+        """停止后台线程（先 flush 残留写盘）。"""
+        self.flush()
+        with self._cv:
+            self._stopped = True
+            self._cv.notify()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self._dirty and not self._stopped:
+                    self._cv.wait()
+                if self._stopped:
+                    return
+                # 去抖等待：期间新 mutation（_pending）延后 deadline；
+                # dirty 保持 True 供 flush 感知代写
+                self._pending = False
+                deadline = time.time() + self.debounce
+                while time.time() < deadline:
+                    self._cv.wait(max(0.01, deadline - time.time()))
+                    if self._stopped:
+                        return
+                    if self._pending:
+                        self._pending = False
+                        deadline = time.time() + self.debounce
+                if not self._dirty:
+                    continue   # 去抖期间已被 flush 代写
+                self._dirty = False
+                self._writing = True
+            try:
+                with workspace_mod._ws_lock(self.ws_dir):
+                    payload = workspace_mod._dumps_workspace(self.ws)
+                workspace_mod.atomic_write_bytes(os.path.join(self.ws_dir, "workspace.json"), payload)
+                if self.ws["_save_count"] % workspace_mod.BACKUP_EVERY_SAVES == 0:
+                    workspace_mod._do_backup(self.ws_dir, self.ws["updated_at"])
+            except Exception:
+                with self._cv:
+                    if not self._stopped:
+                        self._dirty = True   # 写失败重排，下轮再试
+            finally:
+                with self._cv:
+                    self._writing = False
+
+
 class WsStore:
-    """工作区内存缓存 + 磁盘持久化。"""
+    """工作区内存缓存 + 异步合并持久化 + stats/tasks 版本化缓存。"""
 
     def __init__(self, ws_root):
         self.ws_root = ws_root
+        self._lock = threading.RLock()
         self._cache = {}
+        self._schedulers = {}   # ws_id -> SaveScheduler
+        self._stats_cache = {}  # ws_id -> (ws_ref, mut_seq, {"stats":..., "tasks":...})
 
     def get(self, ws_id):
-        ws = self._cache.get(ws_id)
-        if ws is None:
-            ws = workspace_mod.load_workspace(self.ws_root, ws_id)
-            self._cache[ws_id] = ws
-        return ws
+        with self._lock:
+            ws = self._cache.get(ws_id)
+            if ws is None:
+                ws = workspace_mod.load_workspace(self.ws_root, ws_id)
+                self._cache[ws_id] = ws
+            return ws
 
     def save(self, ws):
+        """同步保存（创建/迁移等低频路径）。"""
         workspace_mod.save_workspace(ws)
-        self._cache[ws["id"]] = ws
+        with self._lock:
+            self._cache[ws["id"]] = ws
+
+    def schedule(self, ws):
+        """mutation 后调用：去抖合并写盘（异步，不阻塞请求）。"""
+        with self._lock:
+            sched = self._schedulers.get(ws["id"])
+            if sched is None:
+                sched = SaveScheduler(ws, ws["_dir"])
+                self._schedulers[ws["id"]] = sched
+        sched.schedule()
+
+    def flush(self, ws_id):
+        with self._lock:
+            sched = self._schedulers.get(ws_id)
+        if sched:
+            sched.flush()
+
+    def stop_and_flush(self, ws_id):
+        with self._lock:
+            sched = self._schedulers.pop(ws_id, None)
+        if sched:
+            sched.stop()
+
+    def flush_all(self):
+        with self._lock:
+            scheds = list(self._schedulers.values())
+        for s in scheds:
+            s.flush()
+
+    def stats_and_tasks(self, ws, refresh=False):
+        """ws_stats + all_tasks 缓存（按 ws 对象引用 + _mut_seq 版本化，mutation 自动失效）。"""
+        with self._lock:
+            entry = self._stats_cache.get(ws["id"])
+            seq = ws.get("_mut_seq", 0)
+            if not refresh and entry is not None and entry[0] is ws and entry[1] == seq:
+                return entry[2]
+            st = workspace_mod.ws_stats(ws)
+            ta = tasks_mod.all_tasks(ws)
+            val = {"stats": st, "tasks": ta}
+            self._stats_cache[ws["id"]] = (ws, seq, val)
+            return val
 
     def invalidate(self, ws_id):
-        self._cache.pop(ws_id, None)
+        with self._lock:
+            self._cache.pop(ws_id, None)
+            self._stats_cache.pop(ws_id, None)
 
 
 def _get_scan(root, subdir=None, tolerance_px=None):
@@ -182,19 +319,19 @@ def create_app(ws_root=None, port_file=None):
             ws = store.get(ws_id)
         except Exception:
             return api_error("E_WS_NOT_FOUND", f"工作区不存在: {ws_id}", 404)
-        st = workspace_mod.ws_stats(ws)
-        tasks_all = tasks_mod.all_tasks(ws)
+        data = store.stats_and_tasks(ws, refresh=request.args.get("refresh") == "1")
         return jsonify({
             "id": ws["id"], "package": ws["package"], "config": ws["config"],
             "batch_dir": ws["batch_dir"],
-            "stats": st,
-            "tasks": tasks_all,
+            "stats": data["stats"],
+            "tasks": data["tasks"],
             "classes": ws["package"]["classes"],
             "ui": ws.get("ui") or {"last_task_id": None, "last_img_id": None},
         })
 
     @app.delete("/api/workspaces/<ws_id>")
     def del_ws(ws_id):
+        store.stop_and_flush(ws_id)
         try:
             workspace_mod.delete_workspace(ws_root, ws_id)
         except FileNotFoundError:
@@ -215,8 +352,10 @@ def create_app(ws_root=None, port_file=None):
         errs = validate_config(new_cfg)
         if errs:
             return api_error("E_CONFIG", "; ".join(errs))
-        ws["config"] = new_cfg
-        store.save(ws)
+        with workspace_mod._ws_lock(ws["_dir"]):
+            ws["config"] = new_cfg
+            workspace_mod.touch(ws)
+        store.schedule(ws)
         return jsonify({"config": new_cfg})
 
     @app.put("/api/workspaces/<ws_id>/ui")
@@ -224,18 +363,21 @@ def create_app(ws_root=None, port_file=None):
         """中断恢复：保存上次处理位置（last_task_id / last_img_id，任一可空）。"""
         ws = store.get(ws_id)
         d = request.get_json(silent=True) or {}
-        ui = ws.get("ui") or {"last_task_id": None, "last_img_id": None}
-        ui["last_task_id"] = d.get("last_task_id", ui.get("last_task_id"))
-        ui["last_img_id"] = d.get("last_img_id", ui.get("last_img_id"))
-        ws["ui"] = ui
-        store.save(ws)
+        with workspace_mod._ws_lock(ws["_dir"]):
+            ui = ws.get("ui") or {"last_task_id": None, "last_img_id": None}
+            ui["last_task_id"] = d.get("last_task_id", ui.get("last_task_id"))
+            ui["last_img_id"] = d.get("last_img_id", ui.get("last_img_id"))
+            ws["ui"] = ui
+            workspace_mod.touch(ws)
+        store.schedule(ws)
         return jsonify({"ui": ui})
 
     # ---------- 任务 ----------
     @app.get("/api/workspaces/<ws_id>/tasks")
     def get_tasks(ws_id):
         ws = store.get(ws_id)
-        return jsonify(tasks_mod.all_tasks(ws))
+        data = store.stats_and_tasks(ws, refresh=request.args.get("refresh") == "1")
+        return jsonify(data["tasks"])
 
     @app.get("/api/workspaces/<ws_id>/tasks/<tid>/images")
     def get_task_images(ws_id, tid):
@@ -317,7 +459,7 @@ def create_app(ws_root=None, port_file=None):
         try:
             res = workspace_mod.put_boxes(ws, img_id, d.get("boxes") or [],
                                           task_id=d.get("task_id"))
-            store.save(ws)
+            store.schedule(ws)
             return jsonify({"boxes": res["boxes"], "has_changes": res["has_changes"],
                             "status": res["status"], "warnings": res["warnings"]})
         except KeyError:
@@ -334,7 +476,7 @@ def create_app(ws_root=None, port_file=None):
                                           note=d.get("note"),
                                           verified_box_ids=d.get("verified_box_ids"),
                                           task_id=d.get("task_id"))
-            store.save(ws)
+            store.schedule(ws)
             return jsonify(res)
         except KeyError:
             return api_error("E_IMG_NOT_FOUND", f"图片不存在: {img_id}", 404)
@@ -347,7 +489,7 @@ def create_app(ws_root=None, port_file=None):
         d = request.get_json(silent=True) or {}
         try:
             res = workspace_mod.reset_image(ws, img_id, task_id=d.get("task_id"))
-            store.save(ws)
+            store.schedule(ws)
             return jsonify(res)
         except KeyError:
             return api_error("E_IMG_NOT_FOUND", f"图片不存在: {img_id}", 404)
@@ -378,6 +520,7 @@ def create_app(ws_root=None, port_file=None):
     @app.post("/api/workspaces/<ws_id>/export")
     def do_export(ws_id):
         ws = store.get(ws_id)
+        store.flush(ws_id)   # 导出前落盘未决编辑
         d = request.get_json(silent=True) or {}
         try:
             res = export_mod.export_workspace(ws,
@@ -398,12 +541,15 @@ def create_app(ws_root=None, port_file=None):
     @app.post("/api/shutdown")
     def shutdown():
         def _stop():
+            time.sleep(0.2)
+            store.flush_all()   # 退出前落盘全部未决编辑
             time.sleep(0.3)
             os._exit(0)
 
         threading.Thread(target=_stop, daemon=True).start()
         return jsonify({"ok": True})
 
+    atexit.register(store.flush_all)   # 进程退出兜底
     return app
 
 
