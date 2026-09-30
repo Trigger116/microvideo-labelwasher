@@ -49,6 +49,8 @@ python main.py                          # 或 python main.py --port 8899 --no-br
 图片状态机：`未复核（尚未翻到） → 已核验无修改 / 已修改 / 待裁决`。
 状态**自动判定**：翻下一张时按差异自动判定——有差异→"已修改"、无差异→"已核验无修改"；"待裁决"是唯一人工标记（S 键 toggle，再按取消并按差异自动判定）。撤销至无差异且无备注时自动回"已核验无修改"。
 
+**per-task 状态隔离**（v1.3.0）：同一张图出现在多个批次/任务时，状态与备注按任务槽位独立存储——在 T1-交警 里标"待裁决"不影响 T2 批次里该图仍为"未复核"，互不覆盖。工作区总进度 = 跨任务聚合（任一任务终态即计入，优先级：待裁决 > 已修改 > 已核验无修改 > 未复核）；旧工作区首次打开自动迁移（自动备份 `workspace.pre_v2.json`）。
+
 **中断恢复**：每次翻图/切换任务自动记住位置（任务+图片），重新打开工作区自动回到上次处理位置（任务列表 📌 标记）；中途退出不丢进度。
 
 ## 界面
@@ -80,7 +82,7 @@ python main.py                          # 或 python main.py --port 8899 --no-br
 | F | 画布全屏 |
 | G | 跳转任务内图片序号 |
 | 滚轮 | 以光标为中心缩放 |
-| 右键框（标注模式） | 点击处右侧菜单：删除 + 标签变更列表；重点类优先显示易混淆类，其余类在"更多"（悬停展开二级列表） |
+| 右键框（标注模式） | 点击处右侧菜单：删除 + 标签变更列表；重点类优先显示易混淆类，其余类在"更多"（点击展开二级列表，自动防出屏） |
 
 标注模式鼠标：拖框内=移动；8 向手柄=缩放（对角/对边固定，最小 4px）；空白拖拽=画新框；双击框=改类。
 
@@ -89,17 +91,30 @@ python main.py                          # 或 python main.py --port 8899 --no-br
 - `classes`：类别 `name`（英文名，界面标签展示）/`zh`（仅用于任务描述）/颜色/`identity`（身份类）/`focus`（关注类）/`confusable`（易混淆类 id 列表，右键菜单优先展示）
 - `t1_tasks`：任务 `class_ids` + `banner`（任务目标）+ `criteria`（判类证据）+ `degrade`（快速降级映射）
 - `t2_rules`：无批次清单时的自算规则（low_box_max / high_box_min / batch_size）
-- `boundary_tolerance_px` / `move_epsilon` / `export{strict, csv_bom, decimals}` / `ui{autosave_ms, undo_limit}`
+- `boundary_tolerance_px` / `move_epsilon` / `export{strict, csv_bom, decimals}` / `ui{autosave_ms, note_ms, prefetch_next, undo_limit}`
 
 批次清单（plan/batches/*.txt，TSV：`train/images/xxx.jpg\t框数\t备注`）由 `create_workspace` 自动探测（`<输入根>/../plan/batches`），与人工任务工序清单同源。
 
 ## 测试与构建
 
 ```bash
-python -m unittest tests.test_core        # 18 个单元/API 测试（真实包断言由 LABELWASH_REAL_PKG_ROOT 等环境变量驱动，未设置自动跳过）
+PYTHONUTF8=1 python -m pytest tests/ -q    # 33 个单元/API 测试（真实包断言由 LABELWASH_REAL_PKG_ROOT 等环境变量驱动，未设置自动跳过）
 build.bat                                  # PyInstaller onedir + zip
 ```
 
 ## 单实例
 
 重复启动 exe 时自动复用已运行实例并打开浏览器；日志写 `logs/app.log`（UTF-8）；工作区在 exe 同级 `workspaces/`。
+
+## 更新记录
+
+**v1.3.0**
+- per-task 状态机：同图跨 batch/任务状态隔离（旧工作区打开时自动迁移，迁移前自动备份）
+- 性能：异步合并写盘（去抖 400ms，翻图/导出/关闭前强制落盘）、stats 缓存、序列化瘦身；前端 rAF 合帧渲染、双层 canvas（底图/标注分离，拖动不再重采样大图）、裁剪面板增量更新、T1 核验 300ms 防抖合并保存、翻图请求并行 + 下一张预取
+- 修复：标注模式 8 向手柄变形方向错乱、右键"更多"二级菜单易消失/靠屏幕下侧出屏不可点、改类后颜色偶发不变（保存竞态守卫）
+- 配置：`ui.note_ms` / `ui.prefetch_next` 生效（工作区 config 覆盖全局配置）
+
+**v1.2.1** T1 定位轮播全部核验后再按 E 自动翻下一图并定位第一个特写框
+**v1.2.0** T1 定位轮播 E=核验当前框并跳下一未核验框（进度保存逻辑与中断恢复优化）
+**v1.1.1** 特写镜头改为定位到目标框区域的对应缩放（沿袭 v1.0.0 行为）
+**v1.0.0** 首个可用版本：包扫描 → T1 框级 / T2 图级分层审核 → 审计导出
