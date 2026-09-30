@@ -209,7 +209,7 @@ def create_app(ws_root=None, port_file=None):
     # ---------- 健康检查 ----------
     @app.get("/api/health")
     def health():
-        return jsonify({"ok": True, "version": "1.3.0", "time": time.time()})
+        return jsonify({"ok": True, "version": "1.3.1", "time": time.time()})
 
     # ---------- 文件系统浏览（选输入包） ----------
     @app.post("/api/fs/browse")
