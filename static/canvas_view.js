@@ -17,6 +17,17 @@
 "use strict";
 
 const CanvasView = (() => {
+  /* 从 CSS 变量读取颜色（带缓存 + 回退），保证 Canvas 绘制与深色主题一致（R7） */
+  let cssVarCache = {};
+  function cssVar(name, fallback) {
+    if (cssVarCache[name]) return cssVarCache[name];
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      cssVarCache[name] = v || fallback;
+    } catch (e) { cssVarCache[name] = fallback; }
+    return cssVarCache[name];
+  }
+
   const MIN_SCALE = 0.05, MAX_SCALE = 8;
   const HANDLE_R = 5;      // 手柄半径(屏幕px)
   const HIT_HANDLE_R = 9;  // 手柄命中半径
@@ -66,7 +77,7 @@ const CanvasView = (() => {
 
   function drawImageLayer() {
     imgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    imgCtx.fillStyle = "#0a0d11";
+    imgCtx.fillStyle = cssVar("--canvas-bg", "#16161F");
     imgCtx.fillRect(0, 0, viewW, viewH);
     if (!img) return;
     const iw = img.width * scale, ih = img.height * scale;
@@ -83,11 +94,16 @@ const CanvasView = (() => {
     if (!img) return;
     const chipOk = scale >= 0.35;
     for (const b of boxes) {
-      drawBox(b, chipOk);
+      // 拖拽中画的是本地副本（真实框未提交前保持原样）
+      const rb = (drag && drag.boxLocal && b.id === drag.boxLocal.id) ? drag.boxLocal : b;
+      drawBox(rb, chipOk);
     }
     if (selectedId) {
       const b = boxes.find(x => x.id === selectedId);
-      if (b) drawHandles(b);
+      if (b) {
+        const hb = (drag && drag.boxLocal && drag.boxLocal.id === selectedId) ? drag.boxLocal : b;
+        drawHandles(hb);
+      }
     }
     if (preview) drawPreviewRect(preview);
   }
@@ -120,6 +136,7 @@ const CanvasView = (() => {
 
   /* ---------------- 状态设置 ---------------- */
   function setMode(m) {
+    cancelDrag();   // 拖拽中切模式：丢弃未完成拖拽
     mode = m;
     if (m === "annotate" && viewMode === "focus") setViewMode("full");  // 标注操作基于全图坐标
     canvas.style.cursor = mode === "annotate" ? "crosshair" : "grab";
@@ -157,8 +174,8 @@ const CanvasView = (() => {
       : "🔍 浏览模式：滚轮缩放 · 拖拽平移 · 点击选择框 · W 定位";
     hintEl.className = "hint " + mode;
   }
-  function setImage(im) { img = im; selectedId = null; updateHint(); fit(); }
-  function setBoxes(arr) { boxes = arr; markDirty(false); }
+  function setImage(im) { cancelDrag(); img = im; selectedId = null; updateHint(); fit(); }
+  function setBoxes(arr) { cancelDrag(); boxes = arr; markDirty(false); }
   function setClasses(arr) {
     classes = arr; classById = {};
     for (const c of arr) classById[c.id] = c;
@@ -265,7 +282,7 @@ const CanvasView = (() => {
   }
   function chipColor(b) {
     const c = classById[b.class_id];
-    return c && c.color ? c.color : "#64748B";
+    return c && c.color ? c.color : cssVar("--muted", "#9CA3AF");
   }
   function luminance(hex) {
     const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
@@ -291,8 +308,8 @@ const CanvasView = (() => {
 
     // 描边
     const lw = isSel ? 3 : 2;
-    ctx.strokeStyle = isChanged && !isSel ? "#fb923c" : color;
-    if (boxOob(b) && !isSel) ctx.strokeStyle = "#f87171";
+    ctx.strokeStyle = isChanged && !isSel ? cssVar("--changed", "#FB923C") : color;
+    if (boxOob(b) && !isSel) ctx.strokeStyle = cssVar("--oob", "#F87171");
     ctx.lineWidth = lw;
     if (boxOob(b) && !isSel) ctx.setLineDash([5, 4]); else ctx.setLineDash([]);
     ctx.strokeRect(x, y, w, h);
@@ -300,7 +317,7 @@ const CanvasView = (() => {
 
     // 已修改角标
     if (isChanged && w > 14 && h > 14) {
-      ctx.fillStyle = "#fb923c";
+      ctx.fillStyle = cssVar("--changed", "#FB923C");
       ctx.beginPath();
       ctx.moveTo(x, y); ctx.lineTo(x + 11, y); ctx.lineTo(x, y + 11); ctx.closePath();
       ctx.fill();
@@ -349,7 +366,7 @@ const CanvasView = (() => {
     const y1 = Math.min(d.y1, d.y2), y2 = Math.max(d.y1, d.y2);
     const sx = x1 * scale + ox, sy = y1 * scale + oy;
     const w = (x2 - x1) * scale, h = (y2 - y1) * scale;
-    const color = classById[d.classId] ? classById[d.classId].color : "#4f8cff";
+    const color = classById[d.classId] ? classById[d.classId].color : cssVar("--accent", "#3B82F6");
     ctx.fillStyle = color + "22";
     ctx.fillRect(sx, sy, w, h);
     ctx.strokeStyle = color;
@@ -364,8 +381,12 @@ const CanvasView = (() => {
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", () => cancelDrag());
+    canvas.addEventListener("lostpointercapture", (e) => {
+      if (drag && drag.pointerId === e.pointerId) cancelDrag();  // 未收到 up 即丢失捕获：丢弃副本
+    });
     canvas.addEventListener("pointerleave", () => {
-      if (drag) onUp({ clientX: -1e4, clientY: -1e4 });
+      if (drag) onUp({ clientX: -1e4, clientY: -1e4 });  // 兜底提交（有 capture 时几乎不触发）
     });
     canvas.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("contextmenu", (e) => {
@@ -385,34 +406,34 @@ const CanvasView = (() => {
 
   function onWheel(e) {
     e.preventDefault();
+    if (drag) return;   // 拖拽中忽略缩放（labelimg 同款互斥：防 scale 跳变破坏增量几何）
     const p = mousePos(e);
     zoomAt(e.deltaY < 0 ? 1.18 : 1 / 1.18, p.x, p.y);
   }
 
   function onDown(e) {
     if (e.button !== 0) return;
+    if (drag) return;   // 防多指第二 pointerdown 覆盖状态机
     if (!img) return;
     const p = mousePos(e);
     const handle = mode === "annotate" ? hitHandle(p.x, p.y) : null;
     const b = mode === "annotate" || mode === "browse" ? hitBox(p.x, p.y) : null;
 
     if (handle) {
-      drag = startResize(b, handle, p);
+      // hitHandle 基于 selectedId 命中；用选中框本体（修复重叠框时拖到非选中框）
+      const sb = boxes.find(x => x.id === selectedId);
+      if (!sb) return;
+      drag = startResize(sb, handle, p, e.pointerId);
       if (callbacks.onEditStart) callbacks.onEditStart();
     } else if (b) {
       selectedId = b.id;
       if (callbacks.onSelectBox) callbacks.onSelectBox(b.id);
       if (mode === "annotate") {
         if (callbacks.onEditStart) callbacks.onEditStart();
-        const iv = toImg(p.x, p.y);
-        drag = {
-          kind: "move",
-          box: b,
-          orig: { cx: b.cx, cy: b.cy },
-          startImg: iv, startScreen: p,
-        };
+        // labelimg 模式：深拷贝 boxLocal，拖拽全程只改副本，onUp 一次性提交
+        drag = { kind: "move", box: b, boxLocal: { ...b }, lastScreen: p, pointerId: e.pointerId };
       } else {
-        drag = { kind: "pan", startScreen: p, moved: false, startOx: ox, startOy: oy };
+        drag = { kind: "pan", startScreen: p, moved: false, startOx: ox, startOy: oy, pointerId: e.pointerId };
       }
     } else {
       selectedId = null;
@@ -421,25 +442,25 @@ const CanvasView = (() => {
         const iv = toImg(p.x, p.y);
         drag = {
           kind: "draw",
-          startImg: iv, curImg: iv, startScreen: p,
+          startImg: iv, curImg: iv, startScreen: p, pointerId: e.pointerId,
           classId: callbacks.defaultNewClass ? callbacks.defaultNewClass() : 2,
         };
       } else {
-        drag = { kind: "pan", startScreen: p, moved: false, startOx: ox, startOy: oy };
+        drag = { kind: "pan", startScreen: p, moved: false, startOx: ox, startOy: oy, pointerId: e.pointerId };
       }
     }
-    canvas.setPointerCapture(e.pointerId);
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
     markDirty(false);
   }
 
   function onMove(e) {
     const p = mousePos(e);
     // 光标样式
-    if (!drag) updateCursor(p);
-    if (!drag) return;
-    const dx = p.x - drag.startScreen.x, dy = p.y - drag.startScreen.y;
+    if (!drag) { updateCursor(p); return; }
+    if ((e.buttons & 1) === 0) { cancelDrag(); return; }  // 左键已松开但未收到 up：丢弃副本
 
     if (drag.kind === "pan") {
+      const dx = p.x - drag.startScreen.x, dy = p.y - drag.startScreen.y;
       if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
       if (drag.moved) {
         ox = drag.startOx + dx; oy = drag.startOy + dy;
@@ -449,16 +470,18 @@ const CanvasView = (() => {
       return;
     }
     if (drag.kind === "move") {
-      const ix = drag.startImg.x + dx / scale, iy = drag.startImg.y + dy / scale;
-      const b = drag.box;
+      // 增量式：每步 delta 按当前 scale 换算（滚轮/动画中途变 scale 不再跳飞）
+      const dx = (p.x - drag.lastScreen.x) / scale, dy = (p.y - drag.lastScreen.y) / scale;
+      drag.lastScreen = p;
+      const b = drag.boxLocal;
       const hw = b.w / 2, hh = b.h / 2;
-      b.cx = Math.min(1 - hw, Math.max(hw, drag.orig.cx + (ix - drag.startImg.x) / img.width));
-      b.cy = Math.min(1 - hh, Math.max(hh, drag.orig.cy + (iy - drag.startImg.y) / img.height));
+      b.cx = Math.min(1 - hw, Math.max(hw, b.cx + dx / img.width));
+      b.cy = Math.min(1 - hh, Math.max(hh, b.cy + dy / img.height));
       markDirty(false);   // 热路径：仅标注层
       return;
     }
     if (drag.kind === "resize") {
-      applyResize(drag, p);
+      applyResizeIncremental(drag, p);
       markDirty(false);
       return;
     }
@@ -475,13 +498,15 @@ const CanvasView = (() => {
     const d = drag;
     drag = null;
 
-    if (d.kind === "pan" && d.moved) { markDirty(true); return; }
-    if (d.kind === "move") {
-      if (callbacks.onBoxesChanged) callbacks.onBoxesChanged([d.box]);
-      return;
-    }
-    if (d.kind === "resize") {
-      if (callbacks.onBoxesChanged) callbacks.onBoxesChanged([d.box]);
+    if (d.kind === "pan") { if (d.moved) markDirty(true); return; }
+    if (d.kind === "move" || d.kind === "resize") {
+      // 提交副本回原对象（保持数组内对象同一性）；框已被撤销/删除则丢弃副本
+      if (d.boxLocal && d.box && boxes.includes(d.box)) {
+        const changed = d.box.cx !== d.boxLocal.cx || d.box.cy !== d.boxLocal.cy ||
+          d.box.w !== d.boxLocal.w || d.box.h !== d.boxLocal.h;
+        Object.assign(d.box, d.boxLocal);
+        if (changed && callbacks.onBoxesChanged) callbacks.onBoxesChanged([d.box]);
+      }
       return;
     }
     if (d.kind === "draw") {
@@ -508,43 +533,45 @@ const CanvasView = (() => {
     }
   }
 
-  function startResize(b, dir, p) {
+  function cancelDrag() {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    if (d.kind === "draw") preview = null;
+    try { canvas.releasePointerCapture(d.pointerId); } catch (err) {}
+    markDirty(false);   // 副本丢弃，不提交、不触发保存
+  }
+
+  function startResize(sb, dir, p, pointerId) {
+    const e = boxEdges(sb);
     return {
-      kind: "resize", box: b, dir,
-      startImg: toImg(p.x, p.y), startScreen: p,
-      orig: { cx: b.cx, cy: b.cy, w: b.w, h: b.h },
+      kind: "resize", box: sb, boxLocal: { ...sb }, dir, pointerId,
+      lastScreen: p,
+      // 工作边状态（图像 px，随指针累积；固定边保持不变）
+      edges: { x1: e.x1 * img.width, y1: e.y1 * img.height, x2: e.x2 * img.width, y2: e.y2 * img.height },
     };
   }
 
-  function applyResize(d, p) {
-    const b = d.box;
-    const ix = d.startImg.x + (p.x - d.startScreen.x) / scale;
-    const iy = d.startImg.y + (p.y - d.startScreen.y) / scale;
-    // 图像坐标像素
-    const px = Math.max(0, Math.min(ix, img.width)), py = Math.max(0, Math.min(iy, img.height));
-    const o = d.orig;
-    let x1 = (o.cx - o.w / 2) * img.width, y1 = (o.cy - o.h / 2) * img.height;
-    let x2 = (o.cx + o.w / 2) * img.width, y2 = (o.cy + o.h / 2) * img.height;
+  function applyResizeIncremental(d, p) {
+    // 每步增量按当前 scale 换算为图像 px，在上一帧工作边上累积（固定边不动）
+    const dx = (p.x - d.lastScreen.x) / scale, dy = (p.y - d.lastScreen.y) / scale;
+    d.lastScreen = p;
+    const g = d.edges;
 
     // dir 为单字母方向：固定边 = 不含该方向字母（如 nw 手柄固定右 e/下 s 边）
     const fixedX1 = !d.dir.includes("w"), fixedY1 = !d.dir.includes("n");
     const fixedX2 = !d.dir.includes("e"), fixedY2 = !d.dir.includes("s");
 
-    if (!fixedX1) x1 = Math.min(px, x2 - MIN_BOX_PX);
-    if (!fixedY1) y1 = Math.min(py, y2 - MIN_BOX_PX);
-    if (!fixedX2) x2 = Math.max(px, x1 + MIN_BOX_PX);
-    if (!fixedY2) y2 = Math.max(py, y1 + MIN_BOX_PX);
+    if (!fixedX1) g.x1 = Math.max(0, Math.min(g.x2 - MIN_BOX_PX, g.x1 + dx));
+    if (!fixedX2) g.x2 = Math.min(img.width, Math.max(g.x1 + MIN_BOX_PX, g.x2 + dx));
+    if (!fixedY1) g.y1 = Math.max(0, Math.min(g.y2 - MIN_BOX_PX, g.y1 + dy));
+    if (!fixedY2) g.y2 = Math.min(img.height, Math.max(g.y1 + MIN_BOX_PX, g.y2 + dy));
 
-    // 钳制到图像
-    if (x1 < 0) { if (!fixedX1) x1 = 0; }
-    if (y1 < 0) { if (!fixedY1) y1 = 0; }
-    if (x2 > img.width) { if (!fixedX2) x2 = img.width; }
-    if (y2 > img.height) { if (!fixedY2) y2 = img.height; }
-
-    b.cx = ((x1 + x2) / 2) / img.width;
-    b.cy = ((y1 + y2) / 2) / img.height;
-    b.w = (x2 - x1) / img.width;
-    b.h = (y2 - y1) / img.height;
+    const b = d.boxLocal;
+    b.cx = (g.x1 + g.x2) / 2 / img.width;
+    b.cy = (g.y1 + g.y2) / 2 / img.height;
+    b.w = (g.x2 - g.x1) / img.width;
+    b.h = (g.y2 - g.y1) / img.height;
   }
 
   function isDragging() { return !!drag; }
@@ -569,7 +596,7 @@ const CanvasView = (() => {
   return {
     init, resize, setMode, setImage, setBoxes, setClasses, setSelected,
     getSelected, getMode, fit, zoomAt, zoomIn, zoomOut, focusBox, render,
-    setViewMode, setCropBox, getViewMode, getCropBox, isDragging,
+    setViewMode, setCropBox, getViewMode, getCropBox, isDragging, cancelDrag,
     get boxes() { return boxes; },
   };
 })();

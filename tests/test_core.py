@@ -154,6 +154,57 @@ class TestDiffs(unittest.TestCase):
         self.assertFalse(diffs.diff_boxes(orig, cur_small, move_eps=0.0005)["has_changes"])
         self.assertTrue(diffs.diff_boxes(orig, cur_big, move_eps=0.0005)["has_changes"])
 
+    def test_boundary_adjust(self):
+        orig = [{"id": "b1", "class_id": 1, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}]
+        # 仅宽变化（中心固定）→ 框微调
+        d = diffs.diff_boxes(orig, [{"id": "b1", "class_id": 1, "cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.2}])
+        self.assertEqual(d["counts"]["boundary_adjust"], 1)
+        self.assertEqual(d["counts"]["moved"], 0)
+        self.assertEqual(d["counts"]["total_diff"], 1)
+        # 仅高变化（中心固定）→ 框微调
+        d = diffs.diff_boxes(orig, [{"id": "b1", "class_id": 1, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.35}])
+        self.assertEqual(d["counts"]["boundary_adjust"], 1)
+        self.assertEqual(d["counts"]["moved"], 0)
+        # 中心也动 → moved（与框微调互斥）
+        d = diffs.diff_boxes(orig, [{"id": "b1", "class_id": 1, "cx": 0.501, "cy": 0.5, "w": 0.3, "h": 0.2}])
+        self.assertEqual(d["counts"]["boundary_adjust"], 0)
+        self.assertEqual(d["counts"]["moved"], 1)
+        # 改类 + 微调同框 → 两类各计 1（与历史口径一致：类别与几何独立计数）
+        d = diffs.diff_boxes(orig, [{"id": "b1", "class_id": 2, "cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.2}])
+        self.assertEqual(d["counts"]["class_changed"], 1)
+        self.assertEqual(d["counts"]["boundary_adjust"], 1)
+        self.assertEqual(d["counts"]["total_diff"], 2)
+
+    def test_boundary_adjust_epsilon_boundary(self):
+        orig = [{"id": "b1", "class_id": 1, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}]
+        # 中心位移 ≤ eps（0.0004 < 0.0005）→ 仍算框微调
+        d = diffs.diff_boxes(orig, [{"id": "b1", "class_id": 1, "cx": 0.5004, "cy": 0.5, "w": 0.3, "h": 0.2}],
+                             move_eps=0.0005)
+        self.assertEqual(d["counts"]["boundary_adjust"], 1)
+        # 中心位移 > eps → moved
+        d = diffs.diff_boxes(orig, [{"id": "b1", "class_id": 1, "cx": 0.5006, "cy": 0.5, "w": 0.3, "h": 0.2}],
+                             move_eps=0.0005)
+        self.assertEqual(d["counts"]["moved"], 1)
+
+    def test_diff_events_order_and_ops(self):
+        orig = [{"id": "b1", "class_id": 4, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2},
+                {"id": "b2", "class_id": 2, "cx": 0.1, "cy": 0.1, "w": 0.1, "h": 0.1}]
+        cur = [{"id": "b1", "class_id": 4, "cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.2},
+               {"id": "b_new_1", "class_id": 3, "cx": 0.7, "cy": 0.7, "w": 0.1, "h": 0.1}]
+        ev = diffs.diff_events(orig, cur)
+        # 顺序确定性：当前框序的 ~/+ 在前，orig 序的 - 在后
+        self.assertEqual([e["type"] for e in ev], ["boundary_adjust", "added", "removed"])
+        self.assertEqual(ev[0]["id"], "b1")
+        self.assertEqual(ev[1]["class_id"], 3)
+        self.assertEqual(ev[2]["class_id"], 2)
+        # 改类 + 移动同框 → 两条事件
+        cur2 = [{"id": "b1", "class_id": 0, "cx": 0.55, "cy": 0.5, "w": 0.2, "h": 0.2},
+                {"id": "b2", "class_id": 2, "cx": 0.1, "cy": 0.1, "w": 0.1, "h": 0.1}]
+        ev2 = diffs.diff_events(orig, cur2)
+        self.assertEqual([e["type"] for e in ev2], ["class_changed", "moved"])
+        # 无变更 → 空
+        self.assertEqual(diffs.diff_events(orig, orig), [])
+
     def test_oob_tolerance(self):
         b = {"cx": 0.952, "cy": 0.5, "w": 0.1, "h": 0.1}  # x2=1.002
         self.assertTrue(diffs.boxes_out_of_bounds([b], 1000, 1000, tol_px=0))
@@ -438,6 +489,19 @@ class TestExport(unittest.TestCase):
         self.assertTrue(csv_bytes.startswith("﻿".encode("utf-8")))
         self.assertIn("已修改".encode("utf-8"), csv_bytes)
         self.assertIn("builder".encode("utf-8"), csv_bytes)
+        # CSV 新增两列（变更摘要 + 逐框明细），前 5 列顺序不变
+        csv_lines = csv_bytes.decode("utf-8-sig").replace("\r", "").split("\n")
+        header = csv_lines[0].split(",")
+        self.assertEqual(header[:5], ["文件名", "split", "原始框数", "状态", "修改说明或疑问"])
+        self.assertEqual(header[5:], ["变更摘要", "逐框明细"])
+        a1_row = next(l for l in csv_lines if l.startswith("a1.jpg,"))
+        self.assertIn("改类1", a1_row)
+        self.assertIn("改类:", a1_row)          # 逐框明细：类别名用 zh
+        a3_row = next(l for l in csv_lines if l.startswith("a3.jpg,"))
+        self.assertIn("新增1", a3_row)
+        self.assertIn("新增:", a3_row)
+        unchanged_row = next(l for l in csv_lines if l.startswith("a2."))
+        self.assertIn("无", unchanged_row)      # 无变更图摘要="无"
         # 输入目录未被修改
         after = io_utils.dir_tree_hash(root, exclude_names=["review_fix_done"])
         self.assertEqual(before, after)
@@ -599,6 +663,12 @@ class TestApi(unittest.TestCase):
         # 图片文件
         r = c.get(f"/api/workspaces/{ws_id}/images/{img_id}/file")
         self.assertEqual(r.status_code, 200)
+        # CSV 预览与导出同源（表头含新增两列）
+        r = c.get(f"/api/workspaces/{ws_id}/csv")
+        self.assertEqual(r.status_code, 200)
+        csv_head = r.data.decode("utf-8-sig").split("\r\n")[0]
+        self.assertEqual(csv_head,
+                         "文件名,split,原始框数,状态,修改说明或疑问,变更摘要,逐框明细")
         # 导出
         out = os.path.join(self.pkg_root, "review_fix_done")
         r = c.post(f"/api/workspaces/{ws_id}/export",

@@ -209,7 +209,7 @@ def create_app(ws_root=None, port_file=None):
     # ---------- 健康检查 ----------
     @app.get("/api/health")
     def health():
-        return jsonify({"ok": True, "version": "1.3.1", "time": time.time()})
+        return jsonify({"ok": True, "version": "1.4.0", "time": time.time()})
 
     # ---------- 文件系统浏览（选输入包） ----------
     @app.post("/api/fs/browse")
@@ -499,16 +499,8 @@ def create_app(ws_root=None, port_file=None):
     def get_csv(ws_id):
         ws = store.get(ws_id)
         agg = workspace_mod.aggregate_states(ws) if ws.get("task_states") is not None else None
-        lines = ["文件名,split,原始框数,状态,修改说明或疑问"]
-        from diffs import diff_boxes
-        for im in ws["images"]:
-            st = (agg[im["id"]] if agg else im)
-            note = st["note"] or ""
-            if st["status"] == "已修改" and not note:
-                d = diff_boxes(im["orig_boxes"], im["boxes"])
-                note = _note_summary(im, d)
-            lines.append(",".join([im["name"], im["split"], str(im["orig_box_count"]),
-                                   st["status"], note.replace(",", "，")]))
+        header, rows, _ = export_mod.build_csv_rows(ws, agg)
+        lines = [",".join(header)] + [",".join(r) for r in rows]
         from flask import Response
         return Response("﻿" + "\r\n".join(lines) + "\r\n", mimetype="text/csv; charset=utf-8")
 
@@ -567,16 +559,3 @@ def _list_drives():
 def _img_changed(im):
     return any(b.get("changed") or b.get("is_new") for b in im["boxes"]) or \
         len(im["boxes"]) != len(im["orig_boxes"])
-
-
-def _note_summary(im, diff):
-    parts = []
-    if diff["counts"]["class_changed"]:
-        parts.append(f"改类{diff['counts']['class_changed']}")
-    if diff["counts"]["added"]:
-        parts.append(f"新增{diff['counts']['added']}")
-    if diff["counts"]["removed"]:
-        parts.append(f"删除{diff['counts']['removed']}")
-    if diff["counts"]["moved"]:
-        parts.append(f"移动{diff['counts']['moved']}")
-    return "/".join(parts)

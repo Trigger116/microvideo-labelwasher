@@ -224,11 +224,18 @@ def task_images(ws, task_id, offset=0, limit=50):
     for img_id, tids in page:
         im = img_by_id[img_id]
         st = get_task_state(ws, task_id, img_id)
+        # 框级核验进度：仅 T1（任务目标框中已核验数）；T2 无目标框概念
+        if task["kind"] == "t2":
+            verified_target_count = None
+        else:
+            vb = set(im.get("verified_box_ids") or [])
+            verified_target_count = sum(1 for bid in tids if bid in vb)
         out.append({
             "img_id": img_id, "name": im["name"], "split": im["split"],
             "box_count": len(im["boxes"]),
             "target_box_ids": tids,
             "target_count": len(tids),
+            "verified_target_count": verified_target_count,
             "status": st["status"], "note": st["note"],
             "has_changes": _img_changed(im),
         })

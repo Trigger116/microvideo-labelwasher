@@ -230,6 +230,10 @@ const App = (() => {
     ImageStore.clear();
     $("#task-list").innerHTML = "";
     taskEls.clear(); groupHeads.t1 = null; groupHeads.t2 = null;
+    $("#task-image-list").innerHTML = "";
+    $("#task-image-list").classList.add("hidden");
+    imgListEls.clear();
+    activeRowEl = null;
     $("#task-banner").innerHTML = "";
     $("#crop-grid").innerHTML = "";
     $("#img-name").textContent = "";
@@ -312,6 +316,7 @@ const App = (() => {
       if (!task) throw new Error("任务不存在: " + tid);
       state.taskId = tid; state.task = task;
       state.queue = r.images; state.queueIdx = -1;
+      renderImgList(r.images, r.total);
       $("#task-banner").innerHTML = `
         <div>🎯 <b>${task.name}</b>
           ${task.banner ? ` — <span class="focus">${task.banner}</span>` : ""}</div>
@@ -356,6 +361,99 @@ const App = (() => {
     }
   }
 
+  /* ============ 任务图片列表（左侧面板，R2） ============ */
+  const imgListEls = new Map();   // img_id → {el, lampImg, lampBox, row}
+  let listTouched = false, listTouchedTimer = null;
+  function renderImgList(rows, total) {
+    const wrap = $("#task-image-list");
+    imgListEls.clear();
+    activeRowEl = null;
+    wrap.innerHTML = "";
+    wrap.classList.toggle("hidden", !rows.length);
+    if (!rows.length) return;
+    const cap = document.createElement("div");
+    cap.className = "img-list-head";
+    cap.textContent = `📄 图片（${total}）`;
+    wrap.appendChild(cap);
+    const list = document.createElement("div");
+    list.className = "img-list-rows";
+    rows.forEach((row, i) => {
+      const el = document.createElement("div");
+      el.className = "img-row";
+      el.innerHTML = `<span class="lamp lamp-img"></span><span class="lamp lamp-box"></span><span class="irow-name mono"></span>`;
+      const nameEl = el.querySelector(".irow-name");
+      nameEl.textContent = row.name.replace(/\.jpg$/i, "");
+      nameEl.title = row.name;
+      el.addEventListener("click", () => openQueueImage(i));
+      list.appendChild(el);
+      imgListEls.set(row.img_id, { el, row, idx: i,
+        lampImg: el.querySelector(".lamp-img"), lampBox: el.querySelector(".lamp-box") });
+    });
+    wrap.appendChild(list);
+    if (total > rows.length) {
+      const tip = document.createElement("div");
+      tip.className = "img-list-tip";
+      tip.textContent = `共 ${total} 张，仅显示前 ${rows.length} 张`;
+      wrap.appendChild(tip);
+    }
+    // 用户手动滚动列表期间，翻图高亮不抢滚动（防打扰）；1.5s 无操作恢复
+    wrap.addEventListener("wheel", () => {
+      listTouched = true;
+      clearTimeout(listTouchedTimer);
+      listTouchedTimer = setTimeout(() => { listTouched = false; }, 1500);
+    }, { passive: true });
+    if (state.queueIdx >= 0) updateImgRow(state.queueIdx);
+  }
+  function lampState(row) {   // 灯① 图状态：灰=未复核 绿=已核验(含已修改) 黄=待裁决
+    if (row.status === "待裁决") return ["arb", "待裁决"];
+    if (row.status === "未复核") return ["no", "未复核"];
+    return ["ok", row.status || "已核验"];
+  }
+  function boxLampState(row) {   // 灯② 框核验进度（仅 T1；T2 不渲染）
+    if (row.verified_target_count == null) return null;
+    const n = row.verified_target_count, t = row.target_count;
+    if (!t) return ["no", "框核验 0/0"];
+    if (n >= t) return ["full", `框核验 ${n}/${t}`];
+    if (n > 0) return ["part", `框核验 ${n}/${t}`];
+    return ["no", `框核验 0/${t}`];
+  }
+  let activeRowEl = null;   // 保证同一时刻只有一行高亮
+  function updateImgRow(i) {
+    const row = state.queue[i];
+    if (!row) return;
+    const it = imgListEls.get(row.img_id);
+    if (!it) return;
+    it.row = row;
+    const [lc, lt] = lampState(row);
+    it.lampImg.className = "lamp lamp-img " + lc;
+    it.lampImg.title = lt;
+    const bl = boxLampState(row);
+    it.lampBox.classList.toggle("hidden", !bl);
+    if (bl) {
+      it.lampBox.className = "lamp lamp-box " + bl[0];
+      it.lampBox.title = bl[1];
+    }
+    const active = i === state.queueIdx;
+    if (active && activeRowEl && activeRowEl !== it.el) activeRowEl.classList.remove("active");
+    if (active) activeRowEl = it.el;
+    it.el.classList.toggle("active", active);
+    if (active && !listTouched) it.el.scrollIntoView({ block: "nearest" });
+  }
+  /* 状态/核验/保存后把当前图最新状态同步回队列行并刷新列表灯 */
+  function syncRowFromImage() {
+    if (!state.image || state.queueIdx < 0) return;
+    const row = state.queue[state.queueIdx];
+    if (!row || row.img_id !== state.image.img.id) return;
+    row.status = state.image.status;
+    row.note = state.image.note;
+    row.has_changes = state.image.has_changes;
+    if (row.verified_target_count != null) {
+      const vb = new Set(state.image.verified_box_ids);
+      row.verified_target_count = row.target_box_ids.filter(id => vb.has(id)).length;
+    }
+    updateImgRow(state.queueIdx);
+  }
+
   /* 状态展示：除"待裁决"外不由人工设置，翻图时自动判定（有差异→已修改 / 无差异→已核验无修改） */
   const STATUS_LABELS = {
     "未复核": "○ 未复核", "已核验无修改": "✅ 已核验无修改",
@@ -392,6 +490,7 @@ const App = (() => {
       state.image.note = r.note;
       state.image.has_changes = r.has_changes;
       updateStatusUI();
+      syncRowFromImage();
       await refreshProgress();
     } catch (e) { /* 忽略：下次翻图自动重试 */ }
   }
@@ -415,6 +514,7 @@ const App = (() => {
       state.image.status = r.status;
       state.image.note = r.note;
       updateStatusUI();
+      syncRowFromImage();
       await refreshProgress();
       toast("图片已标为待裁决 ⚖️（再按 S 取消）", "ok");
     } catch (e) { toast(e.message, "error"); }
@@ -432,6 +532,7 @@ const App = (() => {
 
   async function openQueueImage(idx) {
     if (idx < 0 || idx >= state.queue.length) return;
+    CanvasView.cancelDrag();   // 翻图互斥：丢弃未完成拖拽（副本不提交）
     const navToken = ++state.navToken;   // 本次导航令牌：等待期间新发起的翻图会使它过期
     await flush();
     if (navToken !== state.navToken) return;
@@ -467,6 +568,7 @@ const App = (() => {
       CanvasView.render();
       renderCrops();
       updateStatusUI();
+      syncRowFromImage();   // 图片列表：新图状态灯 + 当前行高亮
       setBadge("saved");
       saveUiPosition();   // 中断恢复：记录当前任务+图位置（异步静默）
       // 定位轮播保持：新图从第一个轮播框开始（无可见框则回全图）
@@ -613,6 +715,7 @@ const App = (() => {
         renderCrops();
         updateStatusUI();
         updateNavUI();
+        syncRowFromImage();
         for (const w of r.warnings || []) toast(w, "warn");
         // 撤销至无差异且无备注 → 自动回"已核验无修改"（该图已看过；翻图时统一自动判定兜底）
         if (!r.has_changes && state.image.status === "已修改" &&
@@ -623,6 +726,7 @@ const App = (() => {
           if (stillOn(imgId)) {
             state.image.status = s.status;
             updateStatusUI();
+            syncRowFromImage();
           }
         }
         await refreshProgress();
@@ -668,6 +772,7 @@ const App = (() => {
       state.image.has_changes = r.has_changes;
       updateStatusUI();
       updateNavUI();
+      syncRowFromImage();
       await refreshProgress();
       toast(`状态 → ${status}`, "ok");
     } catch (e) {
@@ -681,6 +786,7 @@ const App = (() => {
   async function resetImage() {
     if (!state.image) return;
     if (!confirm("恢复原始标注？当前该图所有框改动将丢弃")) return;
+    CanvasView.cancelDrag();   // 重置互斥：丢弃未完成拖拽
     await flush();
     const imgId = state.image.img.id;
     try {
@@ -699,6 +805,7 @@ const App = (() => {
       renderCrops();
       updateStatusUI();
       updateNavUI();
+      syncRowFromImage();
       await refreshProgress();
       toast("已恢复原始标注", "ok");
     } catch (e) { toast(e.message, "error"); }
@@ -722,6 +829,7 @@ const App = (() => {
   }
   function applyUndoRedo(from, to) {
     if (!state.image || !from.length) return;
+    CanvasView.cancelDrag();   // 撤销/重做互斥：丢弃未完成拖拽（快照替换 boxes 数组）
     const snap = from.pop();
     to.push(JSON.parse(JSON.stringify(state.image.boxes)));
     state.image.boxes = snap;
@@ -738,6 +846,7 @@ const App = (() => {
   async function changeBoxClass(boxId, classId) {
     const b = state.image.boxes.find(x => x.id === boxId);
     if (!b) return;
+    CanvasView.cancelDrag();   // 改类互斥：丢弃未完成拖拽
     pushUndo();
     b.class_id = classId;
     scheduleBoxSave();
@@ -748,6 +857,7 @@ const App = (() => {
   function deleteBox(boxId) {
     const i = state.image.boxes.findIndex(x => x.id === boxId);
     if (i < 0) return;
+    CanvasView.cancelDrag();   // 删除互斥：丢弃未完成拖拽
     pushUndo();
     state.image.boxes.splice(i, 1);
     CanvasView.setSelected(null);
@@ -781,6 +891,7 @@ const App = (() => {
     if (ids.has(boxId)) ids.delete(boxId); else ids.add(boxId);
     state.image.verified_box_ids = [...ids];
     renderCrops();            // 本地立即反映（✓ 颜色/标记）
+    syncRowFromImage();       // 图片列表框核验灯即时更新
     scheduleVerifiedSave();   // 300ms 防抖合并 PUT
     refreshProgress();
   }
@@ -792,8 +903,8 @@ const App = (() => {
     toast(`已降级为 ${tc ? tc.name : targetClassId} 并标记核验`, "ok");
   }
 
-  /* 标注模式右键目标框：点击处右侧菜单 = 删除 + 标签变更列表。
-     重点类（focus）优先显示易混淆类（confusable），其余类收进"更多"（悬停右侧二级列表）。 */
+  /* 标注模式右键目标框：单层完整列表（R6）= 删除 + 易混淆类（若有）+ 全部类别。
+     菜单超长时容器内滚动（max-height 70vh），不再有"更多"二级列表。 */
   function contextMenu(boxId, x, y) {
     document.querySelectorAll(".context-menu").forEach(el => el.remove());
     if (!state.image) return;
@@ -814,7 +925,6 @@ const App = (() => {
     const rest = cls.filter(cc => cc.id !== b.class_id && !confIds.includes(cc.id));
     const clsBtn = (cc) => `<button data-cid="${cc.id}" class="${cc.id === b.class_id ? "selected" : ""}"
       style="border-left-color:${cc.color}" title="改为 ${cc.name}">${cc.id}·${cc.name}</button>`;
-    const moreBtn = (arr) => `<div class="cm-more">更多 ▸<div class="submenu">${arr.map(clsBtn).join("")}</div></div>`;
 
     const menu = document.createElement("div");
     menu.className = "context-menu box-menu";
@@ -822,14 +932,11 @@ const App = (() => {
       <div class="cm-title" style="border-left-color:${c.color}">${c.name}${c.focus ? " ⭐" : ""}</div>
       <button id="cm-delete" class="danger">🗑 删除框</button>
       <div class="sep"></div>
-      <div class="cm-label">标签变更 →</div>
-      <div class="cm-classes">${
-        c.focus
-          ? conf.map(clsBtn).join("") + (rest.length ? moreBtn(rest) : "")
-          : cls.map(clsBtn).join("")
-      }</div>`;
+      ${conf.length ? `<div class="cm-label">易混淆</div><div class="cm-classes">${conf.map(clsBtn).join("")}</div>` : ""}
+      <div class="cm-label">全部类别</div>
+      <div class="cm-classes">${rest.map(clsBtn).join("")}</div>`;
     document.body.appendChild(menu);
-    // 定位：点击处右侧；放不下则翻到左侧（二级菜单反向）；纵向防出屏
+    // 定位：点击处右侧；放不下翻到左侧；纵向防出屏（容器 max-height 内滚动）
     const mw = menu.offsetWidth, mh = menu.offsetHeight;
     let lx = x + 14, ly = y;
     if (lx + mw > window.innerWidth - 8) { lx = x - 14 - mw; menu.classList.add("flip"); }
@@ -842,36 +949,7 @@ const App = (() => {
       document.removeEventListener("pointerdown", onDocDown);
       document.removeEventListener("keydown", onKey);
     };
-    // "更多"点击展开二级列表；展开后动态 clamp 防出屏（下溢上移/右溢翻左）
-    const positionSubmenu = (more) => {
-      const sub = more.querySelector(".submenu");
-      if (!sub) return;
-      const menuFlip = menu.classList.contains("flip");
-      if (menuFlip) { sub.style.left = "auto"; sub.style.right = "calc(100% + 4px)"; }
-      else { sub.style.left = "calc(100% + 4px)"; sub.style.right = "auto"; }
-      const r = sub.getBoundingClientRect();
-      if (r.right > window.innerWidth - 8) {
-        sub.style.left = "auto"; sub.style.right = "calc(100% + 4px)";   // 右溢出 → 翻左
-      } else if (r.left < 8) {
-        sub.style.left = "calc(100% + 4px)"; sub.style.right = "auto";   // 左溢出 → 翻右
-      }
-      const r2 = sub.getBoundingClientRect();
-      let top = -1;
-      if (r2.bottom > window.innerHeight - 8) {   // 下溢出 → 上移（保持顶部不出屏）
-        top = -1 - (r2.bottom - (window.innerHeight - 8));
-        if (more.getBoundingClientRect().top + top < 8) {
-          top = 8 - more.getBoundingClientRect().top;
-        }
-      }
-      sub.style.top = top + "px";
-    };
     menu.addEventListener("click", (e) => {
-      const more = e.target.closest(".cm-more");
-      if (more && !e.target.closest("button")) {
-        more.classList.toggle("open");   // 点击展开/收起，鼠标移出不关闭
-        if (more.classList.contains("open")) positionSubmenu(more);
-        return;
-      }
       const btn = e.target.closest("button");
       if (!btn) return;
       kill();
@@ -915,6 +993,7 @@ const App = (() => {
 
   function toggleCropView() {
     if (!state.image) return;
+    CanvasView.cancelDrag();   // 定位轮播互斥：focusBox 动画改 scale，丢弃未完成拖拽
     if (CanvasView.getViewMode() === "focus") {
       CanvasView.setViewMode("full");
       CanvasView.fit();
@@ -1008,6 +1087,7 @@ const App = (() => {
     if (ctrl && k === "s") { e.preventDefault(); flush(); return; }
 
     if (state.view !== "review" || !state.image) return;
+    if (CanvasView.isDragging()) CanvasView.cancelDrag();   // 键盘操作互斥：一行覆盖所有快捷键入口
 
     if (k === "a" || e.key === "ArrowLeft") { navImage(-1); return; }
     if (k === "d" || e.key === "ArrowRight") { navImage(1); return; }
@@ -1118,9 +1198,9 @@ const App = (() => {
     html.push(`<div class="report-block">
       <h3>📊 变更统计</h3>
       <table>
-        <tr><th>改类</th><th>新增</th><th>删除</th><th>移动</th><th>差异图片</th><th>待裁决</th><th>未复核</th></tr>
+        <tr><th>改类</th><th>新增</th><th>删除</th><th>移动</th><th>框微调</th><th>差异图片</th><th>待裁决</th><th>未复核</th></tr>
         <tr><td>${counts.class_changed ?? 0}</td><td>${counts.added ?? 0}</td><td>${counts.removed ?? 0}</td>
-        <td>${counts.moved ?? 0}</td><td>${r.diff_images ?? 0}</td>
+        <td>${counts.moved ?? 0}</td><td>${counts.boundary_adjust ?? 0}</td><td>${r.diff_images ?? 0}</td>
         <td>${r.status_counts && r.status_counts["待裁决"] || 0}</td>
         <td>${r.status_counts && r.status_counts["未复核"] || 0}</td></tr>
       </table>

@@ -6,6 +6,17 @@
 "use strict";
 
 const CropPanel = (() => {
+  /* 从 CSS 变量读取颜色（带缓存 + 回退），保证 Canvas 绘制与深色主题一致（R7） */
+  let cssVarCache = {};
+  function cssVar(name, fallback) {
+    if (cssVarCache[name]) return cssVarCache[name];
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      cssVarCache[name] = v || fallback;
+    } catch (e) { cssVarCache[name] = fallback; }
+    return cssVarCache[name];
+  }
+
   const SIZE = 96;      // 裁剪画布边长
   const PAD_RATIO = 1.8; // 框外扩倍数
 
@@ -78,16 +89,23 @@ const CropPanel = (() => {
       it.sig = sig;
       drawCrop(it.canvas, b);
       const c = classById[b.class_id];
-      it.nameEl.style.color = c && c.color ? c.color : "#e2e8f0";
+      it.nameEl.style.color = c && c.color ? c.color : cssVar("--text", "#E5E7EB");
       it.nameEl.textContent = (c ? c.name : "?") + (b.is_new ? " ✨新" : "");
     }
     const e = (b.cx - b.w / 2 < 0 || b.cy - b.h / 2 < 0 ||
                b.cx + b.w / 2 > 1 || b.cy + b.h / 2 > 1);
     it.subEl.textContent = e ? "⚠越界 " : "";
     const v = opts.verifiedIds.has(b.id);
-    it.vEl.className = v ? "verified" : "unverified";
+    // R3：✓ 核验标记仅 T1 核心类显示；T2 与 T1 非核心类一律不渲染
+    it.vEl.className = (v ? "verified" : "unverified") + (showVerifyMark(b) ? "" : " hidden");
     it.vEl.textContent = v ? "✓" : "○";
     it.div.classList.toggle("selected", b.id === selectedBoxId);
+  }
+
+  /* ✓ 标记可见性：仅 T1 任务且框属于核心类别（R3） */
+  function showVerifyMark(b) {
+    const t = opts.task;
+    return !!(t && t.kind === "t1" && t.class_ids.includes(b.class_id));
   }
 
   function buildItem(b) {
@@ -105,7 +123,7 @@ const CropPanel = (() => {
     const c = classById[b.class_id];
     const name = document.createElement("div");
     name.className = "cname";
-    name.style.color = c && c.color ? c.color : "#e2e8f0";
+    name.style.color = c && c.color ? c.color : cssVar("--text", "#E5E7EB");
     name.textContent = (c ? c.name : "?") + (b.is_new ? " ✨新" : "");
     meta.appendChild(name);
     const sub = document.createElement("div");
@@ -181,13 +199,13 @@ const CropPanel = (() => {
     g.drawImage(img.bitmap, sx, sy, sw, sh, dx, dy, dw, dh);
     // 框位置叠加
     const c = classById[b.class_id];
-    g.strokeStyle = c && c.color ? c.color : "#4f8cff";
+    g.strokeStyle = c && c.color ? c.color : cssVar("--accent", "#3B82F6");
     g.lineWidth = 1.5;
     const fx = dx + (bx - sx) * k, fy = dy + (by - sy) * k;
     const fw = bw * k, fh = bh * k;
     g.strokeRect(fx, fy, fw, fh);
     if (b.is_new) {
-      g.fillStyle = "#fb923c";
+      g.fillStyle = cssVar("--changed", "#FB923C");
       g.fillRect(fx, fy, 7, 7);
     }
   }

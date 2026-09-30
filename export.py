@@ -19,55 +19,95 @@ def _image_by_ref(ws, split, filename):
     return None
 
 
-def _note_summary(im, diff):
-    """已修改且备注为空时自动填变更摘要。"""
+def _change_summary(diff):
+    """变更摘要文本（0 项省略；无变更返回空串）。备注自动填充与 CSV 摘要列共用。"""
+    c = diff["counts"]
     parts = []
-    cc = diff["counts"]["class_changed"]
-    if cc:
-        parts.append(f"改类{cc}")
-    if diff["counts"]["added"]:
-        parts.append(f"新增{diff['counts']['added']}")
-    if diff["counts"]["removed"]:
-        parts.append(f"删除{diff['counts']['removed']}")
-    if diff["counts"]["moved"]:
-        parts.append(f"移动{diff['counts']['moved']}")
+    for key, label in (("class_changed", "改类"), ("added", "新增"), ("removed", "删除"),
+                       ("moved", "移动"), ("boundary_adjust", "框微调")):
+        if c.get(key):
+            parts.append(f"{label}{c[key]}")
     return "/".join(parts)
 
 
-def _export_csv(ws, pkg_dir, out_subdir, csv_bom, report, agg):
-    """生成复核记录.csv（BOM + CRLF，行序同输入原序）。状态/备注取跨任务聚合。"""
+def _csv_clean(s):
+    """CSV 单元格清洗：逗号/分号全角化、去 CR、换行转全角分号。"""
+    return s.replace(",", "，").replace(";", "；").replace("\r", "").replace("\n", "；")
+
+
+def _detail_text(ws, im, eps):
+    """逐框变更明细（CSV 明细列）：分号分隔；无变更留空。"""
+    from diffs import diff_events
+
+    names = {c["id"]: c.get("zh") or c["name"] for c in ws["package"]["classes"]}
+    parts = []
+    for ev in diff_events(im["orig_boxes"], im["boxes"], eps):
+        bid = ev["id"]
+        t = ev["type"]
+        if t == "class_changed":
+            parts.append(f"[{bid}]改类:{names.get(ev['class_from'], str(ev['class_from']))}"
+                         f"→{names.get(ev['class_to'], str(ev['class_to']))}")
+        elif t == "added":
+            parts.append(f"[{bid}]新增:{names.get(ev['class_id'], str(ev['class_id']))}")
+        elif t == "removed":
+            parts.append(f"[{bid}]删除:{names.get(ev['class_id'], str(ev['class_id']))}")
+        elif t == "boundary_adjust":
+            parts.append(f"[{bid}]框微调")
+        elif t == "moved":
+            parts.append(f"[{bid}]移动")
+    return ";".join(parts)
+
+
+def build_csv_rows(ws, agg=None, eps=None):
+    """复核记录.csv 共享行数据（导出与 API 预览同源，消除双实现漂移）。
+
+    返回 (header, rows, pending_warnings)。行序同输入原序（csv_rows 先行，剩余图在后）。
+    """
     from diffs import diff_boxes
 
-    header = ["文件名", "split", "原始框数", "状态", "修改说明或疑问"]
-    lines = [",".join(header)]
+    if eps is None:
+        eps = float((ws.get("config") or {}).get("move_epsilon", 0.0005))
+    header = ["文件名", "split", "原始框数", "状态", "修改说明或疑问", "变更摘要", "逐框明细"]
+    rows = []
     pending_warnings = []
     seen = set()
     for row in ws["package"].get("csv_rows") or []:
         im = _image_by_ref(ws, row["split"], row["filename"])
         if im is None:
-            lines.append(",".join([row["filename"], row["split"], str(row["orig_box_count"]),
-                                   row["status"], row["note"]]))
+            rows.append([row["filename"], row["split"], str(row["orig_box_count"]),
+                         row["status"], _csv_clean(row["note"] or ""), "", ""])
             continue
         seen.add(im["id"])
         st = agg[im["id"]] if agg else {"status": im["status"], "note": im["note"]}
         note = st["note"] or ""
-        diff = diff_boxes(im["orig_boxes"], im["boxes"])
+        diff = diff_boxes(im["orig_boxes"], im["boxes"], eps)
         if st["status"] == "已修改" and not note:
-            note = _note_summary(im, diff)
+            note = _change_summary(diff)
         elif st["status"] == "待裁决" and not note:
             pending_warnings.append(f"{im['name']}: 待裁决但无原因备注")
-        lines.append(",".join([im["name"], im["split"], str(im["orig_box_count"]),
-                               st["status"], note.replace(",", "，").replace("\r", "").replace("\n", "；")]))
+        rows.append([im["name"], im["split"], str(im["orig_box_count"]),
+                     st["status"], _csv_clean(note),
+                     _change_summary(diff) if diff["has_changes"] else "无",
+                     _detail_text(ws, im, eps)])
     for im in ws["images"]:
         if im["id"] in seen:
             continue
         st = agg[im["id"]] if agg else {"status": im["status"], "note": im["note"]}
-        diff = diff_boxes(im["orig_boxes"], im["boxes"])
-        note = st["note"] or ("/" if False else "")
+        diff = diff_boxes(im["orig_boxes"], im["boxes"], eps)
+        note = st["note"] or ""
         if st["status"] == "已修改" and not note:
-            note = _note_summary(im, diff)
-        lines.append(",".join([im["name"], im["split"], str(im["orig_box_count"]),
-                               st["status"], note.replace(",", "，")]))
+            note = _change_summary(diff)
+        rows.append([im["name"], im["split"], str(im["orig_box_count"]),
+                     st["status"], _csv_clean(note),
+                     _change_summary(diff) if diff["has_changes"] else "无",
+                     _detail_text(ws, im, eps)])
+    return header, rows, pending_warnings
+
+
+def _export_csv(ws, pkg_dir, out_subdir, csv_bom, report, agg):
+    """生成复核记录.csv（BOM + CRLF，行序同输入原序）。状态/备注取跨任务聚合。"""
+    header, rows, pending_warnings = build_csv_rows(ws, agg)
+    lines = [",".join(header)] + [",".join(r) for r in rows]
     csv_text = "\r\n".join(lines) + "\r\n"
     out_path = os.path.join(out_subdir, "复核记录.csv")
     atomic_write_bytes_bom(out_path, csv_text)
@@ -179,16 +219,17 @@ def build_report(ws):
     from diffs import diff_boxes
 
     names = {c["id"]: f"{c['zh']}({c['name']})" for c in ws["package"]["classes"]}
+    eps = float((ws.get("config") or {}).get("move_epsilon", 0.0005))
     agg = aggregate_states(ws) if ws.get("task_states") is not None else None
     conversions = {}
-    counts = {"class_changed": 0, "moved": 0, "added": 0, "removed": 0}
+    counts = {"class_changed": 0, "moved": 0, "boundary_adjust": 0, "added": 0, "removed": 0}
     diff_images = 0
     changed_detail = []
     pending_list = []
     unreviewed = []
     for im in ws["images"]:
         st = (agg[im["id"]] if agg else {"status": im["status"], "note": im["note"]})
-        d = diff_boxes(im["orig_boxes"], im["boxes"])
+        d = diff_boxes(im["orig_boxes"], im["boxes"], eps)
         if d["has_changes"]:
             diff_images += 1
             for k, v in d["conversions"].items():
