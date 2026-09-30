@@ -482,8 +482,9 @@ const CanvasView = (() => {
     let x1 = (o.cx - o.w / 2) * img.width, y1 = (o.cy - o.h / 2) * img.height;
     let x2 = (o.cx + o.w / 2) * img.width, y2 = (o.cy + o.h / 2) * img.height;
 
-    const fixedX1 = d.dir.includes("e"), fixedY1 = d.dir.includes("s");
-    const fixedX2 = d.dir.includes("w"), fixedY2 = d.dir.includes("n");
+    // dir 为单字母方向：固定边 = 不含该方向字母（如 nw 手柄固定右 e/下 s 边）
+    const fixedX1 = !d.dir.includes("w"), fixedY1 = !d.dir.includes("n");
+    const fixedX2 = !d.dir.includes("e"), fixedY2 = !d.dir.includes("s");
 
     if (!fixedX1) x1 = Math.min(px, x2 - MIN_BOX_PX);
     if (!fixedY1) y1 = Math.min(py, y2 - MIN_BOX_PX);

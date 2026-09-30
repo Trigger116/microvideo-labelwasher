@@ -19,6 +19,7 @@ const App = (() => {
     taskId: null, task: null,
     queue: [], queueIdx: -1,
     image: null,             // {img, boxes, orig_boxes, status, note, verified_box_ids, has_changes}
+    navToken: 0,             // 翻图竞态令牌：快速连翻时旧导航的 GET 响应作废
     dirty: false, noteDirty: false,
     saving: false, noteSaving: false,
     boxSaveTimer: null, noteSaveTimer: null,
@@ -344,9 +345,11 @@ const App = (() => {
     if (!state.image || (state.image.status === "待裁决" && !force)) return;
     const target = state.image.has_changes ? "已修改" : "已核验无修改";
     if (state.image.status === target) return;
+    const imgId = state.image.img.id;
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
                               stateBody(target, $("#img-note").value));
+      if (!stillOn(imgId)) return;   // 响应到达前已翻图：丢弃（PUT 只影响旧图服务端状态）
       state.image.status = r.status;
       state.image.note = r.note;
       state.image.has_changes = r.has_changes;
@@ -359,15 +362,18 @@ const App = (() => {
   async function toggleArb() {
     if (!state.image) return;
     await flush();
+    const imgId = state.image.img.id;
     if (state.image.status === "待裁决") {
       await autoResolveStatus(true);   // 取消待裁决 → 按差异自动判定
+      if (!stillOn(imgId)) return;     // 期间已翻图：跳过 toast
       toast(state.image.status === "待裁决" ? "取消失败，请重试"
         : `已取消待裁决 ⚖️（自动判定：${state.image.status}）`, state.image.status === "待裁决" ? "error" : "ok");
       return;
     }
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
                               stateBody("待裁决", $("#img-note").value));
+      if (!stillOn(imgId)) return;
       state.image.status = r.status;
       state.image.note = r.note;
       updateStatusUI();
@@ -388,14 +394,18 @@ const App = (() => {
 
   async function openQueueImage(idx) {
     if (idx < 0 || idx >= state.queue.length) return;
+    const navToken = ++state.navToken;   // 本次导航令牌：等待期间新发起的翻图会使它过期
     await flush();
+    if (navToken !== state.navToken) return;
     await autoResolveStatus();   // 翻走前自动判定上一张状态（待裁决保留）
+    if (navToken !== state.navToken) return;
     const row = state.queue[idx];
     state.queueIdx = idx;
     updateNavUI();
     try {
       const q = state.taskId ? `?task=${encodeURIComponent(state.taskId)}` : "";
       const r = await Api.get(`/api/workspaces/${state.wsId}/images/${row.img_id}${q}`);
+      if (navToken !== state.navToken) return;   // 响应到达前已翻走：丢弃旧图数据
       state.image = {
         img: r.img, boxes: r.boxes, orig_boxes: r.orig_boxes,
         status: r.status, note: r.note,
@@ -494,9 +504,16 @@ const App = (() => {
     clearTimeout(state.noteSaveTimer);
     state.noteSaveTimer = setTimeout(saveNote, CFG.noteMs);
   }
+  /* 保存竞态守卫：异步响应回来时若已翻图，丢弃对 state.image 的写入（防旧图数据污染新图） */
+  function stillOn(imgId) {
+    return state.image && state.image.img.id === imgId;
+  }
   async function flush() {
     clearTimeout(state.boxSaveTimer);
     clearTimeout(state.noteSaveTimer);
+    if (state.savePromise) {   // 等待飞行中的保存完成，堵住换图污染入口
+      try { await state.savePromise; } catch (e) { /* 保存失败已由 saveBoxes 处理 */ }
+    }
     await saveBoxes();
     await saveNote();
   }
@@ -505,43 +522,64 @@ const App = (() => {
     state.dirty = false;
     state.saving = true;
     setBadge("saving");
-    try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/boxes`,
-                              { boxes: state.image.boxes, task_id: state.taskId || null });
-      state.image.boxes = r.boxes;            // 服务端权威（含新框 id 分配）
-      state.image.status = r.status;
-      state.image.has_changes = r.has_changes;
-      CanvasView.setBoxes(state.image.boxes);
-      renderCrops();
-      updateStatusUI();
-      updateNavUI();
-      for (const w of r.warnings || []) toast(w, "warn");
-      // 撤销至无差异且无备注 → 自动回"已核验无修改"（该图已看过；翻图时统一自动判定兜底）
-      if (!r.has_changes && state.image.status === "已修改" &&
-          !($("#img-note").value || "").trim()) {
-        const s = await Api.put(
-          `/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
-          stateBody("已核验无修改", ""));
-        state.image.status = s.status;
+    const imgId = state.image.img.id;
+    const sentBoxes = state.image.boxes;                    // 数组引用快照（编辑是原地改框对象）
+    const sentNew = sentBoxes.filter(b => b.is_new && !b.id); // 待服务端分配 id 的新框
+    const p = (async () => {
+      try {
+        const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/boxes`,
+                                { boxes: sentBoxes, task_id: state.taskId || null });
+        if (!stillOn(imgId)) return;   // 已翻图 → 丢弃响应（服务端已正确落库旧图）
+        if (state.dirty || state.image.boxes !== sentBoxes) {
+          // 飞行中又编辑：不覆盖本地数组；仅按发送序回填服务端新框 id，重排保存
+          const serverNew = r.boxes.filter(b => b.is_new);
+          sentNew.forEach((nb, i) => {
+            if (!nb.id && serverNew[i]) nb.id = serverNew[i].id;
+          });
+          return;
+        }
+        state.image.boxes = r.boxes;   // 服务端权威（含新框 id 分配）
+        state.image.status = r.status;
+        state.image.has_changes = r.has_changes;
+        CanvasView.setBoxes(state.image.boxes);
+        CanvasView.render();           // 立即反映服务端权威框（颜色/形状）
+        renderCrops();
         updateStatusUI();
+        updateNavUI();
+        for (const w of r.warnings || []) toast(w, "warn");
+        // 撤销至无差异且无备注 → 自动回"已核验无修改"（该图已看过；翻图时统一自动判定兜底）
+        if (!r.has_changes && state.image.status === "已修改" &&
+            !($("#img-note").value || "").trim()) {
+          const s = await Api.put(
+            `/api/workspaces/${state.wsId}/images/${imgId}/state`,
+            stateBody("已核验无修改", ""));
+          if (stillOn(imgId)) {
+            state.image.status = s.status;
+            updateStatusUI();
+          }
+        }
+        await refreshProgress();
+        setBadge("saved");
+      } catch (e) {
+        state.dirty = true;
+        setBadge("dirty");
+        toast("保存失败：" + e.message, "error");
+      } finally {
+        state.saving = false;
+        if (state.dirty) scheduleBoxSave();
       }
-      await refreshProgress();
-      setBadge("saved");
-    } catch (e) {
-      state.dirty = true;
-      setBadge("dirty");
-      toast("保存失败：" + e.message, "error");
-    } finally {
-      state.saving = false;
-      if (state.dirty) scheduleBoxSave();
-    }
+    })();
+    state.savePromise = p;
+    await p;
   }
   async function saveNote() {
     if (!state.noteDirty || !state.image) return;
     state.noteDirty = false;
+    const imgId = state.image.img.id;
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
                               stateBody(state.image.status, $("#img-note").value));
+      if (!stillOn(imgId)) return;
       state.image.note = r.note;
       setBadge(state.dirty ? "dirty" : "saved");
     } catch (e) {
@@ -553,9 +591,11 @@ const App = (() => {
   async function setStatus(status) {
     if (!state.image) return;
     await flush();
+    const imgId = state.image.img.id;
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
                               stateBody(status, $("#img-note").value));
+      if (!stillOn(imgId)) return;
       state.image.status = r.status;
       state.image.note = r.note;
       state.image.has_changes = r.has_changes;
@@ -575,17 +615,20 @@ const App = (() => {
     if (!state.image) return;
     if (!confirm("恢复原始标注？当前该图所有框改动将丢弃")) return;
     await flush();
+    const imgId = state.image.img.id;
     try {
-      const r = await Api.post(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/reset`,
-                               { task_id: state.taskId || null });
+      await Api.post(`/api/workspaces/${state.wsId}/images/${imgId}/reset`,
+                     { task_id: state.taskId || null });
       const q = state.taskId ? `?task=${encodeURIComponent(state.taskId)}` : "";
-      const img = await Api.get(`/api/workspaces/${state.wsId}/images/${state.image.img.id}${q}`);
+      const img = await Api.get(`/api/workspaces/${state.wsId}/images/${imgId}${q}`);
+      if (!stillOn(imgId)) return;
       state.image.boxes = img.boxes;
       state.image.status = img.status; state.image.note = img.note;
       state.image.verified_box_ids = img.verified_box_ids;
       state.image.has_changes = img.has_changes;
       CanvasView.setBoxes(state.image.boxes);
       CanvasView.setSelected(null);
+      CanvasView.render();
       renderCrops();
       updateStatusUI();
       updateNavUI();
@@ -617,6 +660,7 @@ const App = (() => {
     state.image.boxes = snap;
     CanvasView.setBoxes(snap);
     CanvasView.setSelected(null);
+    CanvasView.render();   // 立即反映撤销后的框状态
     renderCrops();
     scheduleBoxSave();
   }
@@ -669,9 +713,11 @@ const App = (() => {
     const ids = new Set(state.image.verified_box_ids);
     if (ids.has(boxId)) ids.delete(boxId); else ids.add(boxId);
     state.image.verified_box_ids = [...ids];
+    const imgId = state.image.img.id;
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
                               stateBody(state.image.status, $("#img-note").value));
+      if (!stillOn(imgId)) return;   // 已翻图：核验已写入旧图服务端槽位，丢弃 UI 回写
       state.image.note = r.note;
       renderCrops();
       await refreshProgress();
@@ -730,8 +776,41 @@ const App = (() => {
     menu.style.left = Math.max(4, lx) + "px";
     menu.style.top = Math.max(4, ly) + "px";
 
-    const kill = () => menu.remove();
+    const kill = () => {
+      menu.remove();
+      document.removeEventListener("pointerdown", onDocDown);
+      document.removeEventListener("keydown", onKey);
+    };
+    // "更多"点击展开二级列表；展开后动态 clamp 防出屏（下溢上移/右溢翻左）
+    const positionSubmenu = (more) => {
+      const sub = more.querySelector(".submenu");
+      if (!sub) return;
+      const menuFlip = menu.classList.contains("flip");
+      if (menuFlip) { sub.style.left = "auto"; sub.style.right = "calc(100% + 4px)"; }
+      else { sub.style.left = "calc(100% + 4px)"; sub.style.right = "auto"; }
+      const r = sub.getBoundingClientRect();
+      if (r.right > window.innerWidth - 8) {
+        sub.style.left = "auto"; sub.style.right = "calc(100% + 4px)";   // 右溢出 → 翻左
+      } else if (r.left < 8) {
+        sub.style.left = "calc(100% + 4px)"; sub.style.right = "auto";   // 左溢出 → 翻右
+      }
+      const r2 = sub.getBoundingClientRect();
+      let top = -1;
+      if (r2.bottom > window.innerHeight - 8) {   // 下溢出 → 上移（保持顶部不出屏）
+        top = -1 - (r2.bottom - (window.innerHeight - 8));
+        if (more.getBoundingClientRect().top + top < 8) {
+          top = 8 - more.getBoundingClientRect().top;
+        }
+      }
+      sub.style.top = top + "px";
+    };
     menu.addEventListener("click", (e) => {
+      const more = e.target.closest(".cm-more");
+      if (more && !e.target.closest("button")) {
+        more.classList.toggle("open");   // 点击展开/收起，鼠标移出不关闭
+        if (more.classList.contains("open")) positionSubmenu(more);
+        return;
+      }
       const btn = e.target.closest("button");
       if (!btn) return;
       kill();
@@ -739,9 +818,13 @@ const App = (() => {
       if (btn.dataset.cid !== undefined) changeBoxClass(boxId, +btn.dataset.cid);
     });
     const onDocDown = (e) => {
-      if (!menu.contains(e.target)) { kill(); document.removeEventListener("pointerdown", onDocDown); }
+      if (!menu.contains(e.target)) kill();
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") kill();
     };
     document.addEventListener("pointerdown", onDocDown);
+    document.addEventListener("keydown", onKey);
   }
 
   /* ============ 裁剪面板联动 ============ */
@@ -840,9 +923,11 @@ const App = (() => {
     if (ids.has(boxId)) return;   // 已核验，无需重复保存
     ids.add(boxId);
     state.image.verified_box_ids = [...ids];
+    const imgId = state.image.img.id;
     try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${state.image.img.id}/state`,
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
                               stateBody(state.image.status, $("#img-note").value));
+      if (!stillOn(imgId)) return;   // 已翻图：核验已写入旧图服务端槽位，丢弃 UI 回写
       state.image.note = r.note;
       renderCrops();
       await refreshProgress();

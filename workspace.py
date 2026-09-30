@@ -251,7 +251,10 @@ def put_boxes(ws, img_id, boxes_in, move_eps=None, task_id=None):
             if nb["w"] <= 0 or nb["h"] <= 0:
                 raise ValueError(f"框宽高必须为正: w={nb['w']} h={nb['h']}")
             bid = b.get("id")
-            if bid and bid not in seen_ids and any(o["id"] == bid for o in im["orig_boxes"]):
+            # id 稳定性：orig 框 id 与本次会话已分配的新框 id 都保留（否则 b_new 每次保存换 id，
+            # 框级核验记录会失配丢失）
+            known_ids = {o["id"] for o in im["orig_boxes"]} | {x["id"] for x in im["boxes"]}
+            if bid and bid not in seen_ids and bid in known_ids:
                 nb["id"] = bid
             else:
                 nb["id"] = f"b_new_{int(time.time() * 1000)}_{i + 1}"
