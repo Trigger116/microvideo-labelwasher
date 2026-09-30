@@ -319,15 +319,14 @@ def _broadcast_state(ws, img_id, status, note):
 
 
 def _merge_statuses(statuses):
-    """跨任务槽位聚合：任一任务未复核 → 图未完成；否则 待裁决 > 已修改 > 已核验无修改。"""
+    """跨任务槽位聚合：取最高优先级状态（待裁决 > 已修改 > 已核验无修改 > 未复核）。
+    任一任务槽位终态即计入；全部未复核/无槽位 → 未复核。"""
     if not statuses:
         return None
-    if "未复核" in statuses:
-        return "未复核"
     for s in AGG_STATUS_ORDER:
         if s in statuses:
             return s
-    return "已核验无修改"
+    return "未复核"
 
 
 def aggregate_states(ws):
@@ -402,7 +401,7 @@ def reset_image(ws, img_id, task_id=None):
 
 def ws_stats(ws):
     """进度/状态计数/类别分布。v2 工作区用 per-task 聚合口径：
-    图"完成" = 其所属全部任务槽位都终态（聚合状态见 _merge_statuses）。"""
+    图状态 = 其所属任务槽位中的最高优先级（见 _merge_statuses）。"""
     n = len(ws["images"])
     status_counts = {}
     terminal = 0

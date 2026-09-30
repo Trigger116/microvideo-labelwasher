@@ -268,10 +268,16 @@ class TestTaskStates(unittest.TestCase):
         workspace.put_state(ws, a1["id"], "待裁决", note="反光服存疑", task_id="t1-9")
         self.assertEqual(workspace.get_task_state(ws, "t1-9", a1["id"])["status"], "待裁决")
         self.assertEqual(workspace.get_task_state(ws, "t1-10", a1["id"])["status"], "未复核")
-        # 其他任务槽位未完成 → 聚合仍"未复核"
+        # t1-9 已"待裁决" → 聚合取最高优先级（其他任务未复核不影响）
+        agg = workspace.aggregate_states(ws)
+        self.assertEqual(agg[a1["id"]]["status"], "待裁决")
+        self.assertEqual(agg[a1["id"]]["note"], "反光服存疑")
+        # 全部任务未复核 → 聚合"未复核"
+        workspace.reset_image(ws, a1["id"], task_id="t1-9")
         agg = workspace.aggregate_states(ws)
         self.assertEqual(agg[a1["id"]]["status"], "未复核")
-        # t1-10 写"已核验无修改"（图无框改动，允许）；t2 完成 → 聚合 待裁决 优先
+        # t1-10/t2 完成、t1-9 待裁决 → 聚合仍 待裁决 优先
+        workspace.put_state(ws, a1["id"], "待裁决", note="反光服存疑", task_id="t1-9")
         workspace.put_state(ws, a1["id"], "已核验无修改", task_id="t1-10")
         workspace.put_state(ws, a1["id"], "已核验无修改", task_id=t2_id)
         agg = workspace.aggregate_states(ws)
