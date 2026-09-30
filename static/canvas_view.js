@@ -6,6 +6,13 @@
  * 命中顺序：resize手柄(8px) → 框内部 → 空白。
  * 定位轮播（viewMode="focus"）：始终渲染整幅图，仅视口定位放大到当前框
  * （app.js 调 focusBox），可自由缩放/平移（W 回全图，Q/E 换框）。
+ *
+ * 渲染管线（v1.3.0 性能版）：
+ * - 双层 canvas：#img-canvas 底图（仅平移/缩放/换图重画）+ #main-canvas 标注层
+ *   （拖动/编辑热路径只画这层，消除每帧大图重采样）
+ * - rAF dirty-flag 合帧：render() 只标记，下一帧统一绘制
+ * - viewW/viewH 缓存视口尺寸，drawBox 循环内不再 getBoundingClientRect
+ * - 交互中（拖动/缩放/动画）imageSmoothingQuality 降 low，静止后回 high
  */
 "use strict";
 
@@ -16,8 +23,9 @@ const CanvasView = (() => {
   const MIN_BOX_PX = 4;    // 最小框尺寸(图像px)
   const CHIP_FONT = "11px 'Segoe UI','Microsoft YaHei',sans-serif";
 
-  let canvas, wrap, ctx;
+  let canvas, imgCanvas, wrap, ctx, imgCtx;
   let dpr = 1;
+  let viewW = 0, viewH = 0;      // 视口 CSS 尺寸缓存（resize 时更新）
   let callbacks = {};
   let mode = "browse";            // browse | annotate
   let img = null;                 // {bitmap,width,height}
@@ -33,24 +41,81 @@ const CanvasView = (() => {
   let cropBoxId = null;           // 定位轮播当前框
   let cropInfo = { index: 0, total: 0, nav: "Q/E 上一/下一框" };
 
+  /* rAF 合帧：dirty 标记 → 下一帧 draw */
+  let dirtyImg = true, dirtyAnno = true, rafPending = false;
+  let lowQualityUntil = 0;        // 交互中底图用低质量采样，静止后回 high
+  let preview = null;             // 画新框预览 {x1,y1,x2,y2,classId}（图像坐标）
+
+  function markDirty(all) {
+    dirtyAnno = true;
+    if (all) dirtyImg = true;
+    scheduleDraw();
+  }
+  function scheduleDraw() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => { rafPending = false; draw(); });
+  }
+  function markInteracting() { lowQualityUntil = performance.now() + 150; }
+
+  function draw() {
+    if (!ctx) return;
+    if (dirtyImg) { drawImageLayer(); dirtyImg = false; }
+    if (dirtyAnno) { drawAnnoLayer(); dirtyAnno = false; }
+  }
+
+  function drawImageLayer() {
+    imgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    imgCtx.fillStyle = "#0a0d11";
+    imgCtx.fillRect(0, 0, viewW, viewH);
+    if (!img) return;
+    const iw = img.width * scale, ih = img.height * scale;
+    imgCtx.imageSmoothingEnabled = true;
+    imgCtx.imageSmoothingQuality = performance.now() < lowQualityUntil ? "low" : "high";
+    try {
+      imgCtx.drawImage(img.bitmap, ox, oy, iw, ih);
+    } catch (err) { /* 旧图 bitmap 已被 ImageStore 回收：跳过绘制，等 setImage 换新图 */ }
+  }
+
+  function drawAnnoLayer() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, viewW, viewH);
+    if (!img) return;
+    const chipOk = scale >= 0.35;
+    for (const b of boxes) {
+      drawBox(b, chipOk);
+    }
+    if (selectedId) {
+      const b = boxes.find(x => x.id === selectedId);
+      if (b) drawHandles(b);
+    }
+    if (preview) drawPreviewRect(preview);
+  }
+
   /* ---------------- 初始化 ---------------- */
   function init(cv, wrapEl, cb) {
     canvas = cv; wrap = wrapEl; callbacks = cb || {};
+    imgCanvas = document.getElementById("img-canvas");
     ctx = canvas.getContext("2d");
+    imgCtx = imgCanvas.getContext("2d");
     hintEl = document.getElementById("canvas-hint");
-    const ro = new ResizeObserver(() => { resize(); render(); });
+    const ro = new ResizeObserver(() => { resize(); markDirty(true); });
     ro.observe(wrap);
     resize();
     bindEvents();
+    draw();
   }
 
   function resize() {
     dpr = window.devicePixelRatio || 1;
     const r = wrap.getBoundingClientRect();
-    canvas.width = Math.max(1, Math.round(r.width * dpr));
-    canvas.height = Math.max(1, Math.round(r.height * dpr));
-    canvas.style.width = r.width + "px";
-    canvas.style.height = r.height + "px";
+    viewW = r.width; viewH = r.height;
+    for (const c of [canvas, imgCanvas]) {
+      c.width = Math.max(1, Math.round(viewW * dpr));
+      c.height = Math.max(1, Math.round(viewH * dpr));
+      c.style.width = viewW + "px";
+      c.style.height = viewH + "px";
+    }
   }
 
   /* ---------------- 状态设置 ---------------- */
@@ -59,7 +124,7 @@ const CanvasView = (() => {
     if (m === "annotate" && viewMode === "focus") setViewMode("full");  // 标注操作基于全图坐标
     canvas.style.cursor = mode === "annotate" ? "crosshair" : "grab";
     updateHint();
-    render();
+    markDirty(false);
   }
   function setViewMode(m, boxId, index, total) {
     viewMode = m;
@@ -68,7 +133,7 @@ const CanvasView = (() => {
       cropInfo = { index: index || cropInfo.index, total: total || cropInfo.total, nav: cropInfo.nav };
     }
     updateHint();
-    render();
+    markDirty(false);
   }
   function setCropBox(boxId, index, total, nav) {
     cropBoxId = boxId;
@@ -76,7 +141,7 @@ const CanvasView = (() => {
       index: index || cropInfo.index, total: total || cropInfo.total,
       nav: nav || cropInfo.nav || "Q/E 上一/下一框",
     };
-    if (viewMode === "focus") { updateHint(); render(); }
+    if (viewMode === "focus") { updateHint(); markDirty(false); }
   }
   function getViewMode() { return viewMode; }
   function getCropBox() { return cropBoxId; }
@@ -93,34 +158,33 @@ const CanvasView = (() => {
     hintEl.className = "hint " + mode;
   }
   function setImage(im) { img = im; selectedId = null; updateHint(); fit(); }
-  function setBoxes(arr) { boxes = arr; }
+  function setBoxes(arr) { boxes = arr; markDirty(false); }
   function setClasses(arr) {
     classes = arr; classById = {};
     for (const c of arr) classById[c.id] = c;
   }
-  function setSelected(id) { selectedId = id; render(); }
+  function setSelected(id) { selectedId = id; markDirty(false); }
   function getSelected() { return selectedId; }
   function getMode() { return mode; }
 
   /* ---------------- 视口 ---------------- */
   function fit() {
-    if (!img) { scale = 1; ox = oy = 0; render(); return; }
-    const r = wrap.getBoundingClientRect();
+    if (!img) { scale = 1; ox = oy = 0; markDirty(true); return; }
     const pad = 24;
-    scale = Math.max(MIN_SCALE, Math.min((r.width - pad) / img.width, (r.height - pad) / img.height));
+    scale = Math.max(MIN_SCALE, Math.min((viewW - pad) / img.width, (viewH - pad) / img.height));
     scale = Math.min(MAX_SCALE, scale);
-    ox = (r.width - img.width * scale) / 2;
-    oy = (r.height - img.height * scale) / 2;
-    render();
+    ox = (viewW - img.width * scale) / 2;
+    oy = (viewH - img.height * scale) / 2;
+    markDirty(true);
   }
   function clampScale(s) { return Math.max(MIN_SCALE, Math.min(MAX_SCALE, s)); }
   function zoomAt(factor, sx, sy) {
-    const r = wrap.getBoundingClientRect();
-    const px = sx ?? r.width / 2, py = sy ?? r.height / 2;
+    const px = sx ?? viewW / 2, py = sy ?? viewH / 2;
     const imgX = (px - ox) / scale, imgY = (py - oy) / scale;
     scale = clampScale(scale * factor);
     ox = px - imgX * scale; oy = py - imgY * scale;
-    render();
+    markInteracting();
+    markDirty(true);
   }
   function zoomIn() { zoomAt(1.25); }
   function zoomOut() { zoomAt(0.8); }
@@ -129,10 +193,9 @@ const CanvasView = (() => {
     if (!b || !img) return;
     const cx = b.cx * img.width, cy = b.cy * img.height;
     const bw = Math.max(b.w * img.width, 16), bh = Math.max(b.h * img.height, 16);
-    const r = wrap.getBoundingClientRect();
-    const targetScale = clampScale(Math.max(scale, Math.min(6, Math.min(r.width / (bw * 2.2), r.height / (bh * 2.2)))));
-    const targetOx = r.width / 2 - cx * targetScale;
-    const targetOy = r.height / 2 - cy * targetScale;
+    const targetScale = clampScale(Math.max(scale, Math.min(6, Math.min(viewW / (bw * 2.2), viewH / (bh * 2.2)))));
+    const targetOx = viewW / 2 - cx * targetScale;
+    const targetOy = viewH / 2 - cy * targetScale;
     if (animate) {
       const s0 = scale, x0 = ox, y0 = oy;
       const t0 = performance.now(), dur = 220;
@@ -142,12 +205,12 @@ const CanvasView = (() => {
         const e = 1 - Math.pow(1 - k, 3);
         scale = s0 + (targetScale - s0) * e;
         ox = x0 + (targetOx - x0) * e; oy = y0 + (targetOy - y0) * e;
-        render();
+        markDirty(true);
         if (k < 1) anim = requestAnimationFrame(step);
       };
       anim = requestAnimationFrame(step);
     } else {
-      scale = targetScale; ox = targetOx; oy = targetOy; render();
+      scale = targetScale; ox = targetOx; oy = targetOy; markDirty(true);
     }
   }
 
@@ -211,29 +274,8 @@ const CanvasView = (() => {
     return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
   }
 
-  function render() {
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const r = wrap.getBoundingClientRect();
-    ctx.fillStyle = "#0a0d11";
-    ctx.fillRect(0, 0, r.width, r.height);
-    if (!img) return;
-    const iw = img.width * scale, ih = img.height * scale;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    try {
-      ctx.drawImage(img.bitmap, ox, oy, iw, ih);
-    } catch (err) { /* 旧图 bitmap 已被 ImageStore 回收：跳过绘制，等 setImage 换新图 */ }
-
-    const chipOk = scale >= 0.35;
-    for (const b of boxes) {
-      drawBox(b, chipOk);
-    }
-    if (selectedId) {
-      const b = boxes.find(x => x.id === selectedId);
-      if (b) drawHandles(b);
-    }
-  }
+  /* render()：语义 = 标记脏（rAF 合帧），外部调用无需等待同步绘制 */
+  function render() { markDirty(false); }
 
   function drawBox(b, chipOk) {
     const e = boxEdges(b);
@@ -272,7 +314,7 @@ const CanvasView = (() => {
       const cw = tw + 10, ch = 17;
       let cx0 = x, cy0 = y - ch - 3;
       if (cy0 < 0) cy0 = y + 2;          // 顶部出界 → 画到框内
-      cx0 = Math.max(0, Math.min(cx0, r().width - cw));
+      cx0 = Math.max(0, Math.min(cx0, viewW - cw));
       const dark = luminance(color) > 0.55;
       ctx.fillStyle = color;
       ctx.fillRect(cx0, cy0, cw, ch);
@@ -282,16 +324,14 @@ const CanvasView = (() => {
     }
   }
 
-  function r() { return wrap.getBoundingClientRect(); }
-
   function drawHandles(b) {
     const e = boxEdges(b);
     const x1 = e.x1 * img.width * scale + ox, y1 = e.y1 * img.height * scale + oy;
     const x2 = e.x2 * img.width * scale + ox, y2 = e.y2 * img.height * scale + oy;
     const pts = [
-      [x1, y1, "nwse"], [(x1 + x2) / 2, y1, "ns"], [x2, y1, "nesw"],
-      [x2, (y1 + y2) / 2, "ew"], [x2, y2, "nwse"], [(x1 + x2) / 2, y2, "ns"],
-      [x1, y2, "nesw"], [x1, (y1 + y2) / 2, "ew"],
+      [x1, y1], [(x1 + x2) / 2, y1], [x2, y1],
+      [x2, (y1 + y2) / 2], [x2, y2], [(x1 + x2) / 2, y2],
+      [x1, y2], [x1, (y1 + y2) / 2],
     ];
     if (scale < 0.5) return;  // 太小不画手柄
     for (const [px, py] of pts) {
@@ -302,6 +342,21 @@ const CanvasView = (() => {
       ctx.arc(px, py, HANDLE_R, 0, Math.PI * 2);
       ctx.fill(); ctx.stroke();
     }
+  }
+
+  function drawPreviewRect(d) {
+    const x1 = Math.min(d.x1, d.x2), x2 = Math.max(d.x1, d.x2);
+    const y1 = Math.min(d.y1, d.y2), y2 = Math.max(d.y1, d.y2);
+    const sx = x1 * scale + ox, sy = y1 * scale + oy;
+    const w = (x2 - x1) * scale, h = (y2 - y1) * scale;
+    const color = classById[d.classId] ? classById[d.classId].color : "#4f8cff";
+    ctx.fillStyle = color + "22";
+    ctx.fillRect(sx, sy, w, h);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(sx, sy, w, h);
+    ctx.setLineDash([]);
   }
 
   /* ---------------- 交互事件 ---------------- */
@@ -317,13 +372,13 @@ const CanvasView = (() => {
       e.preventDefault();
       const p = mousePos(e);
       const b = hitBox(p.x, p.y);
-      if (b) { selectedId = b.id; render(); }
+      if (b) { selectedId = b.id; markDirty(false); }
       if (callbacks.onContextMenu) callbacks.onContextMenu(b ? b.id : null, e.clientX, e.clientY);
     });
     canvas.addEventListener("dblclick", (e) => {
       const p = mousePos(e);
       const b = hitBox(p.x, p.y);
-      if (b) { selectedId = b.id; render(); }
+      if (b) { selectedId = b.id; markDirty(false); }
       if (b && callbacks.onDblClickBox) callbacks.onDblClickBox(b.id);
     });
   }
@@ -374,7 +429,7 @@ const CanvasView = (() => {
       }
     }
     canvas.setPointerCapture(e.pointerId);
-    render();
+    markDirty(false);
   }
 
   function onMove(e) {
@@ -386,7 +441,11 @@ const CanvasView = (() => {
 
     if (drag.kind === "pan") {
       if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
-      if (drag.moved) { ox = drag.startOx + dx; oy = drag.startOy + dy; render(); }
+      if (drag.moved) {
+        ox = drag.startOx + dx; oy = drag.startOy + dy;
+        markInteracting();
+        markDirty(true);   // 平移：底图+标注层都重画
+      }
       return;
     }
     if (drag.kind === "move") {
@@ -395,36 +454,20 @@ const CanvasView = (() => {
       const hw = b.w / 2, hh = b.h / 2;
       b.cx = Math.min(1 - hw, Math.max(hw, drag.orig.cx + (ix - drag.startImg.x) / img.width));
       b.cy = Math.min(1 - hh, Math.max(hh, drag.orig.cy + (iy - drag.startImg.y) / img.height));
-      render();
+      markDirty(false);   // 热路径：仅标注层
       return;
     }
     if (drag.kind === "resize") {
       applyResize(drag, p);
-      render();
+      markDirty(false);
       return;
     }
     if (drag.kind === "draw") {
       const iv = toImg(p.x, p.y);
       drag.curImg = iv;
-      render();
-      // 临时绘制新框预览
-      drawPreview(drag);
+      preview = { x1: drag.startImg.x, y1: drag.startImg.y, x2: iv.x, y2: iv.y, classId: drag.classId };
+      markDirty(false);
     }
-  }
-
-  function drawPreview(d) {
-    const x1 = Math.min(d.startImg.x, d.curImg.x), x2 = Math.max(d.startImg.x, d.curImg.x);
-    const y1 = Math.min(d.startImg.y, d.curImg.y), y2 = Math.max(d.startImg.y, d.curImg.y);
-    const sx = x1 * scale + ox, sy = y1 * scale + oy;
-    const w = (x2 - x1) * scale, h = (y2 - y1) * scale;
-    const color = classById[d.classId] ? classById[d.classId].color : "#4f8cff";
-    ctx.fillStyle = color + "22";
-    ctx.fillRect(sx, sy, w, h);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 4]);
-    ctx.strokeRect(sx, sy, w, h);
-    ctx.setLineDash([]);
   }
 
   function onUp(e) {
@@ -432,7 +475,7 @@ const CanvasView = (() => {
     const d = drag;
     drag = null;
 
-    if (d.kind === "pan" && d.moved) { render(); return; }
+    if (d.kind === "pan" && d.moved) { markDirty(true); return; }
     if (d.kind === "move") {
       if (callbacks.onBoxesChanged) callbacks.onBoxesChanged([d.box]);
       return;
@@ -442,6 +485,7 @@ const CanvasView = (() => {
       return;
     }
     if (d.kind === "draw") {
+      preview = null;
       const x1 = Math.min(d.startImg.x, d.curImg.x), x2 = Math.max(d.startImg.x, d.curImg.x);
       const y1 = Math.min(d.startImg.y, d.curImg.y), y2 = Math.max(d.startImg.y, d.curImg.y);
       const w = x2 - x1, h = y2 - y1;
@@ -460,7 +504,7 @@ const CanvasView = (() => {
         if (callbacks.onBoxCreated) callbacks.onBoxCreated(nb);
         if (callbacks.onBoxesChanged) callbacks.onBoxesChanged([nb]);
       }
-      render();
+      markDirty(false);
     }
   }
 

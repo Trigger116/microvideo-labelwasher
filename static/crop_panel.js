@@ -1,4 +1,8 @@
-/* crop_panel.js —— 裁剪缩略面板：纯前端 96×96 裁剪、T1 过滤、快速降级、✓ 核验标记 */
+/* crop_panel.js —— 裁剪缩略面板：纯前端 96×96 裁剪、T1 过滤、快速降级、✓ 核验标记
+ *
+ * v1.3.0 性能版：keyed diff 更新——itemMap(boxId→{div,canvas,meta...})，
+ * 框几何/类未变时只更新文本/颜色/✓/选中 class，不重画缩略图（drawImage 零重采样）。
+ */
 "use strict";
 
 const CropPanel = (() => {
@@ -10,6 +14,10 @@ const CropPanel = (() => {
   let img = null, boxes = [], classes = [], classById = {};
   let opts = { task: null, verifiedIds: new Set() };
   let selectedBoxId = null;
+
+  /* keyed 缓存：boxId → {div, canvas, nameEl, subEl, vEl, sig} */
+  const itemMap = new Map();
+  let taskKey = "";   // 当前任务 id（变化时全量重建，降级按钮随任务规则）
 
   function init(grid, toolbar, cb) {
     gridEl = grid; toolbarEl = toolbar; callbacks = cb || {};
@@ -27,19 +35,59 @@ const CropPanel = (() => {
   }
 
   function render(im, boxArr, clsArr, o) {
-    img = im; boxes = boxArr; opts = o || opts;
+    img = im; boxes = boxArr;
+    const newTaskKey = o && o.task ? o.task.id : "";
+    if (newTaskKey !== taskKey) {   // 任务切换：降级按钮集/过滤规则变化 → 全量重建
+      gridEl.innerHTML = "";
+      itemMap.clear();
+      taskKey = newTaskKey;
+    }
+    opts = o || opts;
     if (clsArr) setClasses(clsArr);
-    gridEl.innerHTML = "";
 
     const shown = visibleBoxes();
     if (!shown.length) {
       gridEl.innerHTML = `<div class="crop-empty">${
         opts.task ? "本图无目标类别框，按 Tab 跳到下一图" : "本图无标注框"}</div>`;
+      itemMap.clear();
       return;
     }
+
+    // diff：新增/保留/移除
+    const seen = new Set();
     for (const b of shown) {
-      gridEl.appendChild(buildItem(b));
+      seen.add(b.id);
+      const it = itemMap.get(b.id);
+      if (it) updateItem(it, b);
+      else itemMap.set(b.id, buildItem(b));
     }
+    for (const [id, it] of itemMap) {
+      if (!seen.has(id)) { it.div.remove(); itemMap.delete(id); }
+    }
+    // 顺序重排（appendChild 移动节点）：T2 focus 排序/框序变化时面板顺序同步
+    for (const b of shown) gridEl.appendChild(itemMap.get(b.id).div);
+  }
+
+  function sigOf(b) {   // 几何+类签名：变化才重画缩略图
+    return `${b.class_id}|${b.cx.toFixed(4)}|${b.cy.toFixed(4)}|${b.w.toFixed(4)}|${b.h.toFixed(4)}|${b.is_new ? 1 : 0}|${b.changed ? 1 : 0}`;
+  }
+
+  function updateItem(it, b) {
+    const sig = sigOf(b);
+    if (it.sig !== sig) {
+      it.sig = sig;
+      drawCrop(it.canvas, b);
+      const c = classById[b.class_id];
+      it.nameEl.style.color = c && c.color ? c.color : "#e2e8f0";
+      it.nameEl.textContent = (c ? c.name : "?") + (b.is_new ? " ✨新" : "");
+    }
+    const e = (b.cx - b.w / 2 < 0 || b.cy - b.h / 2 < 0 ||
+               b.cx + b.w / 2 > 1 || b.cy + b.h / 2 > 1);
+    it.subEl.textContent = e ? "⚠越界 " : "";
+    const v = opts.verifiedIds.has(b.id);
+    it.vEl.className = v ? "verified" : "unverified";
+    it.vEl.textContent = v ? "✓" : "○";
+    it.div.classList.toggle("selected", b.id === selectedBoxId);
   }
 
   function buildItem(b) {
@@ -62,15 +110,10 @@ const CropPanel = (() => {
     meta.appendChild(name);
     const sub = document.createElement("div");
     sub.className = "csub";
-    const e = (b.cx - b.w / 2 < 0 || b.cy - b.h / 2 < 0 ||
-               b.cx + b.w / 2 > 1 || b.cy + b.h / 2 > 1);
-    sub.textContent = e ? "⚠越界 " : "";
     meta.appendChild(sub);
 
     const v = document.createElement("span");
-    v.className = opts.verifiedIds.has(b.id) ? "verified" : "unverified";
-    v.textContent = opts.verifiedIds.has(b.id) ? "✓" : "○";
-    v.title = opts.verifiedIds.has(b.id) ? "已核验（点击取消）" : "标记框已核验（点击切换）";
+    v.title = "标记框已核验（点击切换）";
     v.addEventListener("click", (ev) => {
       ev.stopPropagation();
       if (callbacks.onToggleVerified) callbacks.onToggleVerified(b.id);
@@ -101,12 +144,18 @@ const CropPanel = (() => {
 
     div.addEventListener("click", () => {
       selectedBoxId = b.id;
-      for (const it of gridEl.querySelectorAll(".crop-item")) {
-        it.classList.toggle("selected", it.dataset.boxId === b.id);
+      for (const [id, it] of itemMap) {
+        it.div.classList.toggle("selected", id === b.id);
       }
       if (callbacks.onPick) callbacks.onPick(b.id);
     });
-    return div;
+
+    gridEl.appendChild(div);
+
+    const it = { div, canvas: cv, nameEl: name, subEl: sub, vEl: v,
+                 sig: sigOf(b) };
+    updateItem(it, b);   // 统一初始化 ✓/越界/选中状态
+    return it;
   }
 
   function drawCrop(cv, b) {
@@ -145,8 +194,8 @@ const CropPanel = (() => {
 
   function setSelected(id) {
     selectedBoxId = id;
-    for (const it of gridEl.querySelectorAll(".crop-item")) {
-      it.classList.toggle("selected", it.dataset.boxId === id);
+    for (const [bid, it] of itemMap) {
+      it.div.classList.toggle("selected", bid === id);
     }
   }
 

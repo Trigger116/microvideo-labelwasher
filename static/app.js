@@ -20,14 +20,15 @@ const App = (() => {
     queue: [], queueIdx: -1,
     image: null,             // {img, boxes, orig_boxes, status, note, verified_box_ids, has_changes}
     navToken: 0,             // 翻图竞态令牌：快速连翻时旧导航的 GET 响应作废
-    dirty: false, noteDirty: false,
+    dirty: false, noteDirty: false, verifiedDirty: false,
+    verifiedTimer: null,
     saving: false, noteSaving: false,
     boxSaveTimer: null, noteSaveTimer: null,
     undoStack: [], redoStack: [],
     lastNewClass: 2,         // N 新建框默认类
     prefetchToken: 0,
   };
-  const CFG = { autosaveMs: 500, noteMs: 800, undoLimit: 50 };
+  const CFG = { autosaveMs: 500, noteMs: 800, undoLimit: 50, prefetchNext: 1 };
 
   /* ============ Toast / Modal 工具 ============ */
   function toast(msg, kind) {
@@ -194,6 +195,12 @@ const App = (() => {
     try {
       const r = await Api.get(`/api/workspaces/${wsId}`);
       state.wsId = wsId; state.wsMeta = r;
+      // 工作区 config.ui 覆盖运行时配置（autosave/note 防抖、撤销上限、预取开关）
+      const uiCfg = (r.config && r.config.ui) || {};
+      CFG.autosaveMs = uiCfg.autosave_ms || CFG.autosaveMs;
+      CFG.noteMs = uiCfg.note_ms || CFG.noteMs;
+      CFG.undoLimit = uiCfg.undo_limit || CFG.undoLimit;
+      CFG.prefetchNext = uiCfg.prefetch_next ?? CFG.prefetchNext;
       ImageStore.setWorkspace(wsId);
       CanvasView.setClasses(r.classes);
       CropPanel.setClasses(r.classes);
@@ -222,6 +229,7 @@ const App = (() => {
     state.image = null; state.undoStack = []; state.redoStack = [];
     ImageStore.clear();
     $("#task-list").innerHTML = "";
+    taskEls.clear(); groupHeads.t1 = null; groupHeads.t2 = null;
     $("#task-banner").innerHTML = "";
     $("#crop-grid").innerHTML = "";
     $("#img-name").textContent = "";
@@ -231,6 +239,9 @@ const App = (() => {
   }
 
   /* ============ 任务与进度 ============ */
+  /* keyed 定点更新：taskEls Map upsert，进度刷新不再全量 innerHTML 重建 */
+  const taskEls = new Map();   // taskId → {el, nameEl, metaEl, fillEl}
+  const groupHeads = { t1: null, t2: null };
   function renderTasks(stats, tasks) {
     const fill = $("#global-progress-fill");
     const n = stats.total_images;
@@ -238,32 +249,54 @@ const App = (() => {
     $("#global-progress-text").textContent = `${stats.terminal_images}/${n}`;
 
     const ul = $("#task-list");
-    ul.innerHTML = "";
-    const group = (title, arr, key) => {
-      if (!arr.length) return;
-      const h = document.createElement("div");
-      h.className = "muted"; h.style.cssText = "font-size:12px;margin:8px 0 4px;";
-      h.textContent = title;
-      ul.appendChild(h);
-      for (const t of arr) {
-        const done = key === "verified_boxes" ? t.progress.verified_boxes : t.progress.terminal_images;
-        const total = key === "verified_boxes" ? t.progress.total_boxes : t.progress.total_images;
+    const lastTaskId = (state.wsMeta && state.wsMeta.ui && state.wsMeta.ui.last_task_id) || null;
+    const seen = new Set();
+    const upsert = (t, key) => {
+      seen.add(t.id);
+      let it = taskEls.get(t.id);
+      if (!it) {
         const li = document.createElement("div");
-        li.className = "task-item" + (t.id === state.taskId ? " active" : "") + (done >= total ? " done" : "");
-        const pct = total ? Math.round(done / total * 100) : 100;
-        const lastTaskId = (state.wsMeta && state.wsMeta.ui && state.wsMeta.ui.last_task_id) || null;
-        li.innerHTML = `
-          <div class="tname">${t.id === lastTaskId ? "📌 " : ""}${t.name}</div>
-          <div class="tmeta">${t.kind === "t1"
-            ? `框 ${t.progress.verified_boxes}/${t.progress.total_boxes} · 图 ${t.progress.terminal_images}/${t.progress.total_images}`
-            : `图 ${t.progress.terminal_images}/${t.progress.total_images}`}</div>
-          <div class="tbar"><div class="fill" style="width:${pct}%"></div></div>`;
+        li.className = "task-item";
+        li.innerHTML = `<div class="tname"></div><div class="tmeta"></div>
+          <div class="tbar"><div class="fill"></div></div>`;
         li.addEventListener("click", () => setTask(t.id, tasks));
-        ul.appendChild(li);
+        it = { el: li, nameEl: li.querySelector(".tname"),
+               metaEl: li.querySelector(".tmeta"), fillEl: li.querySelector(".fill") };
+        taskEls.set(t.id, it);
       }
+      const done = key === "verified_boxes" ? t.progress.verified_boxes : t.progress.terminal_images;
+      const total = key === "verified_boxes" ? t.progress.total_boxes : t.progress.total_images;
+      const pct = total ? Math.round(done / total * 100) : 100;
+      it.el.className = "task-item" + (t.id === state.taskId ? " active" : "") + (done >= total ? " done" : "");
+      it.nameEl.textContent = (t.id === lastTaskId ? "📌 " : "") + t.name;
+      it.metaEl.textContent = t.kind === "t1"
+        ? `框 ${t.progress.verified_boxes}/${t.progress.total_boxes} · 图 ${t.progress.terminal_images}/${t.progress.total_images}`
+        : `图 ${t.progress.terminal_images}/${t.progress.total_images}`;
+      it.fillEl.style.width = pct + "%";
     };
-    group("T1 · 框级类别核验", tasks.t1, "verified_boxes");
-    group("T2 · 全图漏标扫视", tasks.t2, "terminal_images");
+    for (const t of tasks.t1) upsert(t, "verified_boxes");
+    for (const t of tasks.t2) upsert(t, "terminal_images");
+    for (const [id, it] of taskEls) {
+      if (!seen.has(id)) { it.el.remove(); taskEls.delete(id); }
+    }
+    // 组头 + 顺序重排（appendChild 移动现有节点，无重建）
+    const head = (kind, title) => {
+      if (!groupHeads[kind]) {
+        const h = document.createElement("div");
+        h.className = "muted"; h.style.cssText = "font-size:12px;margin:8px 0 4px;";
+        groupHeads[kind] = h;
+      }
+      groupHeads[kind].textContent = title;
+      return groupHeads[kind];
+    };
+    if (tasks.t1.length) {
+      ul.appendChild(head("t1", "T1 · 框级类别核验"));
+      for (const t of tasks.t1) ul.appendChild(taskEls.get(t.id).el);
+    } else if (groupHeads.t1) groupHeads.t1.remove();
+    if (tasks.t2.length) {
+      ul.appendChild(head("t2", "T2 · 全图漏标扫视"));
+      for (const t of tasks.t2) ul.appendChild(taskEls.get(t.id).el);
+    } else if (groupHeads.t2) groupHeads.t2.remove();
   }
 
   function normalizeTasks(meta) { // {t1:[],t2:[]}
@@ -297,13 +330,18 @@ const App = (() => {
     } catch (e) { toast(e.message, "error"); }
   }
 
+  /* 进度刷新 200ms 去抖合并（多次触发只发一次 GET），fire-and-forget 不阻塞保存链 */
+  let progressTimer = null;
   async function refreshProgress() {
-    try {
-      const r = await Api.get(`/api/workspaces/${state.wsId}`);
-      state.wsMeta = r;
-      renderTasks(r.stats, r.tasks);
-      updateTabs();
-    } catch (e) { /* 忽略 */ }
+    clearTimeout(progressTimer);
+    progressTimer = setTimeout(async () => {
+      try {
+        const r = await Api.get(`/api/workspaces/${state.wsId}`);
+        state.wsMeta = r;
+        renderTasks(r.stats, r.tasks);
+        updateTabs();
+      } catch (e) { /* 忽略 */ }
+    }, 200);
   }
 
   /* ============ 图片加载与导航 ============ */
@@ -404,16 +442,23 @@ const App = (() => {
     updateNavUI();
     try {
       const q = state.taskId ? `?task=${encodeURIComponent(state.taskId)}` : "";
-      const r = await Api.get(`/api/workspaces/${state.wsId}/images/${row.img_id}${q}`);
+      // 预取前置：与当前图 GET/解码并行（翻图入口即发起，不等渲染完成）
+      if (CFG.prefetchNext && state.queue[idx + 1]) {
+        ImageStore.prefetch(state.queue[idx + 1].img_id);
+      }
+      const token = ++state.prefetchToken;
+      // GET 元数据与图片解码并行（Promise.all 消除串行等待链）
+      const [r, im] = await Promise.all([
+        Api.get(`/api/workspaces/${state.wsId}/images/${row.img_id}${q}`),
+        ImageStore.load(row.img_id, row.name),
+      ]);
       if (navToken !== state.navToken) return;   // 响应到达前已翻走：丢弃旧图数据
+      if (token !== state.prefetchToken) return; // 解码期间已切走
       state.image = {
         img: r.img, boxes: r.boxes, orig_boxes: r.orig_boxes,
         status: r.status, note: r.note,
         verified_box_ids: r.verified_box_ids, has_changes: r.has_changes,
       };
-      const token = ++state.prefetchToken;
-      const im = await ImageStore.load(row.img_id, row.name);
-      if (token !== state.prefetchToken) return; // 已切走
       const keepFocus = CanvasView.getViewMode() === "focus";
       CanvasView.setImage(im);
       CanvasView.setBoxes(state.image.boxes);
@@ -424,8 +469,6 @@ const App = (() => {
       updateStatusUI();
       setBadge("saved");
       saveUiPosition();   // 中断恢复：记录当前任务+图位置（异步静默）
-      // 预取下一张
-      if (state.queue[idx + 1]) ImageStore.prefetch(state.queue[idx + 1].img_id);
       // 定位轮播保持：新图从第一个轮播框开始（无可见框则回全图）
       if (keepFocus) {
         const ids = CropPanel.shownBoxIds;
@@ -508,14 +551,36 @@ const App = (() => {
   function stillOn(imgId) {
     return state.image && state.image.img.id === imgId;
   }
+  /* 核验 ✓ 防抖：本地立即更新，300ms 合并 PUT（T1 连按 E 从每按 1 次请求降为窗口内 1 次） */
+  function scheduleVerifiedSave() {
+    state.verifiedDirty = true;
+    clearTimeout(state.verifiedTimer);
+    state.verifiedTimer = setTimeout(saveVerified, 300);
+  }
+  async function saveVerified() {
+    if (!state.verifiedDirty || !state.image) return;
+    state.verifiedDirty = false;
+    const imgId = state.image.img.id;
+    try {
+      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
+                              stateBody(state.image.status, $("#img-note").value));
+      if (!stillOn(imgId)) return;   // 已翻图：核验已写入旧图服务端槽位，丢弃 UI 回写
+      state.image.note = r.note;     // 仅回写 note（verified_box_ids 本地已更新，不回写防覆盖连按）
+    } catch (e) {
+      state.verifiedDirty = true;    // 失败重排
+      toast(e.message, "error");
+    }
+  }
   async function flush() {
     clearTimeout(state.boxSaveTimer);
     clearTimeout(state.noteSaveTimer);
+    clearTimeout(state.verifiedTimer);   // 核验合并 PUT 必须赶在翻图前落盘
     if (state.savePromise) {   // 等待飞行中的保存完成，堵住换图污染入口
       try { await state.savePromise; } catch (e) { /* 保存失败已由 saveBoxes 处理 */ }
     }
     await saveBoxes();
     await saveNote();
+    await saveVerified();
   }
   async function saveBoxes() {
     if (!state.dirty || !state.image) return;
@@ -708,20 +773,14 @@ const App = (() => {
     }
   }
 
-  async function toggleVerified(boxId) {
+  function toggleVerified(boxId) {
     if (!state.image) return;
     const ids = new Set(state.image.verified_box_ids);
     if (ids.has(boxId)) ids.delete(boxId); else ids.add(boxId);
     state.image.verified_box_ids = [...ids];
-    const imgId = state.image.img.id;
-    try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
-                              stateBody(state.image.status, $("#img-note").value));
-      if (!stillOn(imgId)) return;   // 已翻图：核验已写入旧图服务端槽位，丢弃 UI 回写
-      state.image.note = r.note;
-      renderCrops();
-      await refreshProgress();
-    } catch (e) { toast(e.message, "error"); }
+    renderCrops();            // 本地立即反映（✓ 颜色/标记）
+    scheduleVerifiedSave();   // 300ms 防抖合并 PUT
+    refreshProgress();
   }
 
   async function degrade(boxId, targetClassId) {
@@ -916,22 +975,16 @@ const App = (() => {
     if (next) enterCrop(next);
   }
 
-  /* 框级核验（只加不删；撤销核验用裁剪面板 ✓ toggle） */
-  async function markVerified(boxId) {
+  /* 框级核验（只加不删；撤销核验用裁剪面板 ✓ toggle）。同步本地更新 + 防抖 PUT */
+  function markVerified(boxId) {
     if (!state.image) return;
     const ids = new Set(state.image.verified_box_ids);
     if (ids.has(boxId)) return;   // 已核验，无需重复保存
     ids.add(boxId);
     state.image.verified_box_ids = [...ids];
-    const imgId = state.image.img.id;
-    try {
-      const r = await Api.put(`/api/workspaces/${state.wsId}/images/${imgId}/state`,
-                              stateBody(state.image.status, $("#img-note").value));
-      if (!stillOn(imgId)) return;   // 已翻图：核验已写入旧图服务端槽位，丢弃 UI 回写
-      state.image.note = r.note;
-      renderCrops();
-      await refreshProgress();
-    } catch (e) { toast(e.message, "error"); }
+    renderCrops();            // 本地立即反映
+    scheduleVerifiedSave();   // 300ms 防抖合并 PUT
+    refreshProgress();
   }
 
   /* ============ 键盘快捷键 ============ */

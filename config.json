@@ -111,6 +111,7 @@
   "ui": {
     "prefetch_next": 1,
     "autosave_ms": 500,
+    "note_ms": 800,
     "undo_limit": 50
   }
 }
